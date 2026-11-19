@@ -2,7 +2,13 @@
 
 This command only records/renders. It never uploads or publishes.
 """
-import argparse, glob, json, math, os, re, shutil, subprocess, sys, time
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["MKL_NUM_THREADS"] = "2"
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+os.environ["NUMEXPR_NUM_THREADS"] = "2"
+import argparse, glob, json, math, re, shutil, subprocess, sys, time
 from datetime import datetime
 import numpy as np
 from live_chat import create_live_chat_collector, score_chat_windows, summarize_chat_window, download_chat_replay
@@ -60,9 +66,17 @@ def save_vod_cache_chunk(cache_path, video_id, chunk_idx, chunk_data):
         print(f"warning: could not save vod cache chunk: {e}")
 
 
+_cookies_file = None
+
+
 def ytdlp_cmd(*args):
     """yt-dlp needs a JavaScript runtime for YouTube; it only looks for deno by default, so fall back to node."""
-    cmd = [sys.executable, "-m", "yt_dlp", "--extractor-args", "youtube:player_client=android"]
+    cmd = [sys.executable, "-m", "yt_dlp", "--remote-components", "ejs:github"]
+    c_file = _cookies_file or os.path.join(HERE, "cookies.txt")
+    if c_file and os.path.isfile(c_file):
+        cmd += ["--cookies", c_file]
+    else:
+        cmd += ["--extractor-args", "youtube:player_client=android"]
     if not shutil.which("deno"):
         for rt in ("node", "bun"):
             if shutil.which(rt):
@@ -94,13 +108,14 @@ def source_identity(info, test=False):
 
 
 # ---------- recording ----------
-def start_recorder(url, file_, chunk, max_seconds, outdir):
+def start_recorder(url, file_, chunk, max_seconds, outdir, quality="1080p"):
     os.makedirs(outdir, exist_ok=True)
     pat = os.path.join(outdir, "chunk_%05d.ts")
     if file_:
         inputs = ["-i", file_]
     else:
-        r = run(ytdlp_cmd("-g", "--no-warnings", "-f", "bv[height<=720]+ba/b[height<=720]/b", url))
+        fmt = "bv[height<=1080]+ba/b[height<=1080]/b" if quality == "1080p" else "bv[height<=720]+ba/b[height<=720]/b"
+        r = run(ytdlp_cmd("-g", "--no-warnings", "-f", fmt, url))
         lines = [l for l in r.stdout.splitlines() if l.startswith("http")]
         if r.returncode or not lines:
             sys.exit("could not get a stream URL:\n" + r.stderr[-400:])
@@ -211,12 +226,24 @@ def locked_language():
 
 def whisper_words(audio):
     global _model
+    import gc
     from faster_whisper import WhisperModel
     if _model is None:
-        _model = WhisperModel("base", device="cpu", compute_type="int8")
+        _model = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=4)
     lock = locked_language()
-    segments, info = _model.transcribe(audio, word_timestamps=True, vad_filter=True, task="transcribe", language=lock)
-    segments = list(segments)
+    try:
+        segments, info = _model.transcribe(audio, word_timestamps=True, vad_filter=True, task="transcribe", language=lock)
+        segments = list(segments)
+    except Exception as e:
+        print(f"warning: speech model reset due to memory limit ({e})")
+        del _model
+        _model = None
+        gc.collect()
+        _model = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=4)
+        segments, info = _model.transcribe(audio, word_timestamps=True, vad_filter=True, task="transcribe", language=lock)
+        segments = list(segments)
+    finally:
+        gc.collect()
     spoken_language = info.language or "unknown"
     if lock is None and (getattr(info, "language_probability", 0) or 0) >= 0.6:
         _lang_votes[spoken_language] = _lang_votes.get(spoken_language, 0) + 1
@@ -741,8 +768,10 @@ def cut(chunk_path, words, start, length, out_mp4, credit, crop=False, crop_offs
     write_ass(os.path.join(d, ass_name), words, start, length, credit, caption_margin_v, burn_credit=burn_credit)
     fg = build_video_filter(ass_name, crop=crop, crop_offset=crop_offset, source_roi=source_roi, layout=layout,
                             pan_keys=pan_keys, facecam_roi=facecam_roi)
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}",
-                        "-i", os.path.abspath(chunk_path), "-t", f"{length}",
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-ss", f"{start:.2f}",
+                        "-i", os.path.abspath(chunk_path),
+                        "-t", f"{length}",
                         "-filter_complex", fg, "-af", "asetpts=PTS-STARTPTS",
                         "-c:v", "libx264", "-preset", "veryfast",
                         "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
@@ -752,6 +781,24 @@ def cut(chunk_path, words, start, length, out_mp4, credit, crop=False, crop_offs
         print("ffmpeg cut failed:", r.stderr[-300:])
         return False
     return True
+
+
+def find_existing_stream_folder(base_dir, clean_channel, video_id):
+    """Find an existing folder for this stream/video from a previous run or retry."""
+    if not os.path.isdir(base_dir) or not video_id:
+        return None
+    matches = []
+    suffix1 = f"_{clean_channel}_{video_id}"
+    suffix2 = f"_{video_id}"
+    for name in os.listdir(base_dir):
+        full = os.path.join(base_dir, name)
+        if os.path.isdir(full):
+            if name.endswith(suffix1) or name.endswith(suffix2):
+                matches.append(name)
+    if matches:
+        matches.sort()
+        return matches[0]
+    return None
 
 
 # ---------- main loop ----------
@@ -800,9 +847,13 @@ def main():
                     help="burn 'via <creator>' text on the video for the first 4s (default: False; credit belongs in post captions)")
     ap.add_argument("--no-cache", action="store_true",
                     help="ignore existing VOD analysis cache and re-analyze all chunks")
+    ap.add_argument("--quality", choices=("1080p", "720p"), default="1080p",
+                    help="source capture quality (default: 1080p)")
+    ap.add_argument("--cookies", help="path to cookies.txt for YouTube authentication")
     ap.add_argument("--output-dir", default=None, help="override the output folder")
     a = ap.parse_args()
-    global _forced_language
+    global _forced_language, _cookies_file
+    _cookies_file = a.cookies
     if a.spoken_language != "auto":
         _forced_language = a.spoken_language
     elif a.channel == "hindi":
@@ -836,22 +887,29 @@ def main():
     else:
         who, title, info = source_identity({"uploader": "local source"}, True if a.test else False), os.path.basename(a.file), {}
 
-    start_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    clean_channel = re.sub(r"[^\w-]+", "_", who.get("name") or "stream").strip("_")
-    stream_folder = f"{start_stamp}_{clean_channel}"
-    video_id = info.get("id")
-    if not video_id and a.file:
-        import hashlib
-        video_id = hashlib.md5(a.file.encode()).hexdigest()[:12]
-    if video_id:
-        stream_folder += f"_{video_id}"
-
     target_channel = a.channel
     if not target_channel:
         target_channel = "hindi" if a.spoken_language == "hi" else "english"
 
     base_out = TEST_OUT if who["test"] else OUTPUT_DIR
-    out_dir = os.path.abspath(a.output_dir) if a.output_dir else os.path.join(base_out, target_channel, stream_folder)
+    target_parent = os.path.join(base_out, target_channel)
+
+    clean_channel = re.sub(r"[^\w-]+", "_", who.get("name") or "stream").strip("_")
+    video_id = info.get("id")
+    if not video_id and a.file:
+        import hashlib
+        video_id = hashlib.md5(a.file.encode()).hexdigest()[:12]
+
+    existing = find_existing_stream_folder(target_parent, clean_channel, video_id) if not a.output_dir else None
+    if existing:
+        stream_folder = existing
+    else:
+        start_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        stream_folder = f"{start_stamp}_{clean_channel}"
+        if video_id:
+            stream_folder += f"_{video_id}"
+
+    out_dir = os.path.abspath(a.output_dir) if a.output_dir else os.path.join(target_parent, stream_folder)
     os.makedirs(out_dir, exist_ok=True)
     wdir = os.path.join(WORK, target_channel, stream_folder)
     os.makedirs(wdir, exist_ok=True)
@@ -884,7 +942,7 @@ def main():
     else:
         chat_fallback = "disabled by test mode or audio-only mode"
 
-    rec = start_recorder(a.url, a.file, a.chunk, a.max_seconds, wdir)
+    rec = start_recorder(a.url, a.file, a.chunk, a.max_seconds, wdir, quality=a.quality)
     done, n_clips = set(), 0
     try:
         if a.vod:
@@ -1170,6 +1228,11 @@ def main():
                 rec.kill()
                 rec.wait()
         shutil.rmtree(wdir, ignore_errors=True)
+        if not a.output_dir and os.path.isdir(out_dir) and not os.listdir(out_dir):
+            try:
+                os.rmdir(out_dir)
+            except OSError:
+                pass
     print(f"done. {n_clips} clip(s) in {out_dir}. Nothing posted.")
 
 

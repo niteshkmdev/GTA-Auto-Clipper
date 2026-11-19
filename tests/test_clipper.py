@@ -313,3 +313,33 @@ class SpokenLanguageLockTest(unittest.TestCase):
         self.assertEqual(clip.locked_language(), "hi")
         clip._forced_language = None
         clip._lang_votes = {}
+
+    def test_ytdlp_cmd_appends_cookies_when_present(self):
+        import clip, tempfile, os
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tf:
+            tf.write(b"# Netscape HTTP Cookie File\n")
+            tf_path = tf.name
+        try:
+            clip._cookies_file = tf_path
+            cmd = clip.ytdlp_cmd("-g", "https://example.com")
+            self.assertIn("--cookies", cmd)
+            self.assertIn(tf_path, cmd)
+        finally:
+            clip._cookies_file = None
+            if os.path.exists(tf_path):
+                os.remove(tf_path)
+
+    def test_find_existing_stream_folder(self):
+        import clip, tempfile, os
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(clip.find_existing_stream_folder(d, "techno", None))
+            self.assertIsNone(clip.find_existing_stream_folder(d, "techno", "xyz123"))
+
+            f1 = os.path.join(d, "20261120-010000_techno_xyz123")
+            f2 = os.path.join(d, "20261120-020000_techno_xyz123")
+            os.makedirs(f1)
+            os.makedirs(f2)
+
+            # Picks the earliest folder
+            res = clip.find_existing_stream_folder(d, "techno", "xyz123")
+            self.assertEqual(res, "20261120-010000_techno_xyz123")
