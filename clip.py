@@ -5,7 +5,7 @@ This command only records/renders. It never uploads or publishes.
 import argparse, glob, json, math, os, re, shutil, subprocess, sys, time
 from datetime import datetime
 import numpy as np
-from live_chat import create_live_chat_collector, score_chat_windows, summarize_chat_window
+from live_chat import create_live_chat_collector, score_chat_windows, summarize_chat_window, download_chat_replay
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(HERE, "output")
@@ -584,17 +584,56 @@ def detect_smart_frame(video_path, start, length, sample_count=9):
             samples.append(detections)
     finally:
         cap.release()
+    active_top = 0
     active_bottom = frame_height
     if bottom_black_ratios:
         black_ratio = np.mean(np.stack(bottom_black_ratios), axis=0)
-        row = frame_height - 1
-        while row >= 0 and black_ratio[row] >= 0.98:
-            row -= 1
-        if frame_height - 1 - row >= frame_height * 0.03:
-            active_bottom = row + 1
+        top_row = 0
+        while top_row < frame_height and black_ratio[top_row] >= 0.98:
+            top_row += 1
+        bot_row = frame_height - 1
+        while bot_row >= 0 and black_ratio[bot_row] >= 0.98:
+            bot_row -= 1
+        if top_row >= frame_height * 0.03 or (frame_height - 1 - bot_row) >= frame_height * 0.03:
+            active_top = top_row
+            active_bottom = bot_row + 1
     roi = choose_vertical_game_roi(frame_width, frame_height, samples, active_bottom)
+    if roi is None and frame_width > 0 and frame_height > 0 and (active_bottom - active_top) < frame_height * 0.92:
+        roi = (0, active_top, frame_width, active_bottom - active_top)
     facecam_box = choose_facecam_box(frame_width, frame_height, samples)
     return choose_crop_offset(frame_width, frame_height, samples), roi, facecam_box
+
+
+def decide_layout(facecam_roi, source_roi=None, reaction_score=0.0, chat_summary=None, words_count=0):
+    """
+    Intelligently select the best vertical framing:
+    - "fit": when wide cinematic cutscenes or letterbox bars are detected.
+    - "split": when a creator webcam is present AND the moment is reaction-heavy (high reaction score, hype words, or chat reaction burst).
+    - "fill": when no webcam exists, or when the moment is pure action/driving (low streamer reaction, let gameplay cover the screen).
+    """
+    # 1. Cinematic letterbox bars (cutscenes)
+    if source_roi and len(source_roi) == 4:
+        _, _, _, roi_h = source_roi
+        if 0 < roi_h < 820:
+            return "fit"
+
+    # 2. No facecam detected -> cannot split
+    if not facecam_roi:
+        return "fill"
+
+    # 3. Streamer reaction check
+    reaction_val = float(reaction_score or 0.0)
+    chat_reactions = int((chat_summary or {}).get("reaction_chatters", 0))
+
+    if reaction_val >= 0.85:
+        return "split"
+    if chat_reactions >= 3:
+        return "split"
+    if words_count >= 14 and reaction_val >= 0.40:
+        return "split"
+
+    # 4. Action/driving focus: full vertical gameplay
+    return "fill"
 
 
 def build_video_filter(ass_name, crop=False, crop_offset=0.5, source_roi=None, layout="fit", pan_keys=None,
@@ -603,6 +642,8 @@ def build_video_filter(ass_name, crop=False, crop_offset=0.5, source_roi=None, l
     side facecam). layout "fit": the full source sits in the middle over a blurred copy.
     layout "split": creator facecam cropped on top, gameplay on bottom."""
     offset = min(1.0, max(0.0, float(crop_offset)))
+    if layout == "auto":
+        layout = "split" if facecam_roi else "fill"
     if crop and layout != "split":
         layout = "fill"
     if layout == "split":
@@ -697,9 +738,10 @@ def main():
     ap.add_argument("--top", type=int, default=1, help="clips per chunk")
     ap.add_argument("--gameplay-confirmed", action="store_true",
                     help="confirm you visually checked that the source shows actual GTA gameplay before a live capture")
-    ap.add_argument("--layout", choices=("fill", "fit", "split"), default="fill",
-                    help="fill (default): gameplay covers the full 9:16 screen, centered and shifted away from a side "
-                         "facecam; fit: whole source in the middle over a blurred background; "
+    ap.add_argument("--layout", choices=("auto", "fill", "fit", "split"), default="auto",
+                    help="auto (default): smart switch between split, fill, and fit; "
+                         "fill: gameplay covers the full 9:16 screen, centered and shifted away from a side facecam; "
+                         "fit: whole source in the middle over a blurred background; "
                          "split: creator facecam cropped on top, gameplay on bottom")
     ap.add_argument("--split", action="store_true", help="shortcut for --layout split (creator facecam on top, gameplay on bottom)")
     ap.add_argument("--crop", action="store_true", help="same as --layout fill (kept for old commands)")
@@ -716,6 +758,8 @@ def main():
     ap.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE)
     ap.add_argument("--max-clips", type=int, default=0, help="stop after generating N clips (0 = no limit)")
     ap.add_argument("--keep-minutes", type=int, default=30)
+    ap.add_argument("--vod", action="store_true",
+                    help="VOD mode: process full completed video or stream, download live-chat replay, globally rank all moments, and extract the top highlights")
     ap.add_argument("--burn-credit", action="store_true",
                     help="burn 'via <creator>' text on the video for the first 4s (default: False; credit belongs in post captions)")
     ap.add_argument("--output-dir", default=None, help="override the output folder")
@@ -724,8 +768,8 @@ def main():
     _forced_language = None if a.spoken_language == "auto" else a.spoken_language
     if not a.url and not a.file:
         sys.exit(__doc__)
-    if a.file and not a.test:
-        sys.exit("--file is only allowed with --test.")
+    if a.file and not a.test and not a.vod:
+        sys.exit("--file requires --vod or --test.")
     if a.file:
         a.file = os.path.abspath(a.file)
         if not os.path.isfile(a.file):
@@ -733,19 +777,19 @@ def main():
     if a.max_seconds < 0 or a.chunk < 1 or a.clip_len < 1 or a.top < 1:
         sys.exit("--max-seconds must be 0 or more; --chunk, --clip-len and --top must be positive.")
     if a.url and not a.test and not a.gameplay_confirmed:
-        sys.exit("Live capture stopped: first inspect the source video and confirm actual GTA gameplay is visible. "
+        sys.exit("Capture stopped: first inspect the source video and confirm actual GTA gameplay is visible. "
                  "Then rerun with --gameplay-confirmed. A GTA title or facecam alone is not gameplay.")
     if a.no_chat:
         a.moment_source = "audio"
 
     if a.url:
         info = stream_info(a.url)
-        if not info.get("is_live") and not a.test:
-            sys.exit("The source is not live. Use --test for a local/non-live test input.")
+        if not info.get("is_live") and not a.test and not a.vod:
+            sys.exit("The source is not live. Use --vod for completed streams/videos, or --test for test runs.")
         who = source_identity(info, a.test)
         title = info.get("title", "")
     else:
-        who, title, info = source_identity({"uploader": "local source"}, True), os.path.basename(a.file), {}
+        who, title, info = source_identity({"uploader": "local source"}, True if a.test else False), os.path.basename(a.file), {}
 
     start_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     clean_channel = re.sub(r"[^\w-]+", "_", who.get("name") or "stream").strip("_")
@@ -767,7 +811,22 @@ def main():
     print(f"moment finder: {a.moment_source} (chat mode falls back to audio/speech when chat is unavailable)")
     chat = None
     chat_source, chat_fallback = "disabled", None
-    if a.url and not a.test and a.moment_source != "audio":
+    vod_chat_messages = []
+
+    if a.vod:
+        if a.url and a.moment_source != "audio":
+            print("checking for YouTube live chat replay via yt-dlp ...")
+            vod_chat_messages = download_chat_replay(a.url, wdir)
+            if vod_chat_messages:
+                chat_source = "yt-dlp-chat-replay"
+                print(f"loaded {len(vod_chat_messages)} chat replay messages for scoring")
+            else:
+                chat_source = "audio-speech-fallback"
+                chat_fallback = "no chat replay available; using audio/speech scoring"
+                print("no chat replay found; using audio/speech scoring")
+        else:
+            chat_fallback = "disabled by audio-only mode"
+    elif a.url and not a.test and a.moment_source != "audio":
         chat, chat_source, chat_fallback = create_live_chat_collector(a.url, info.get("id"))
         if chat:
             chat.start()
@@ -775,50 +834,99 @@ def main():
             chat_source = "audio-speech-fallback"
             print(f"live chat unavailable ({chat_fallback}); using audio/speech scoring")
     else:
-            chat_fallback = "disabled by test mode or audio-only mode"
+        chat_fallback = "disabled by test mode or audio-only mode"
+
     rec = start_recorder(a.url, a.file, a.chunk, a.max_seconds, wdir)
     done, n_clips = set(), 0
     try:
-        while True:
-            chunks = sorted(glob.glob(os.path.join(wdir, "chunk_*.ts")))
-            finished = chunks if rec.poll() is not None else chunks[:-1]
-            todo = [c for c in finished if c not in done]
-            if not todo:
-                if rec.poll() is not None:
+        if a.vod:
+            target_top = a.max_clips if a.max_clips > 0 else 5
+            print(f"VOD mode active: scanning full source, will select Top {target_top} moments globally...")
+            candidates = []
+            current_offset = 0.0
+            while True:
+                chunks = sorted(glob.glob(os.path.join(wdir, "chunk_*.ts")))
+                finished = chunks if rec.poll() is not None else chunks[:-1]
+                todo = [c for c in finished if c not in done]
+                if not todo:
+                    if rec.poll() is not None:
+                        break
+                    time.sleep(2)
+                    continue
+                c = todo[0]; done.add(c)
+                chunk_length = media_duration(c)
+                chunk_start_time = current_offset
+                current_offset += chunk_length
+
+                chunk_chat = []
+                if vod_chat_messages:
+                    raw_chunk_chat = [m for m in vod_chat_messages if chunk_start_time <= m["t"] < chunk_start_time + chunk_length]
+                    chunk_chat = [{"t": m["t"] - chunk_start_time, "user": m["user"], "text": m["text"]} for m in raw_chunk_chat]
+
+                chunk_moment_source = a.moment_source
+                if chunk_moment_source in {"chat", "combined"} and not chunk_chat:
+                    chunk_moment_source = "audio"
+
+                scan_top = max(3, a.top)
+                moments, words = pick_moments(c, a.clip_len, scan_top, a.min_score, a.lead_in,
+                                              chunk_chat, chunk_moment_source)
+                for score, start in moments:
+                    candidates.append({
+                        "score": score,
+                        "start": start,
+                        "global_start": chunk_start_time + start,
+                        "chunk": c,
+                        "words": words,
+                        "chunk_chat": chunk_chat,
+                        "chunk_moment_source": chunk_moment_source,
+                    })
+                print(f"  scanned chunk {len(done)} ({chunk_start_time/60:.1f}m - {current_offset/60:.1f}m): found {len(moments)} candidate moment(s)")
+
+            # Global ranking across all candidates
+            candidates.sort(key=lambda item: item["score"], reverse=True)
+            selected = []
+            for cand in candidates:
+                if len(selected) >= target_top:
                     break
-                time.sleep(3)
-                continue
-            c = todo[0]; done.add(c)
-            print(f"analysing {os.path.basename(c)} ...")
-            chunk_length = media_duration(c)
-            chunk_end_epoch = os.path.getmtime(c)
-            chunk_start_epoch = chunk_end_epoch - chunk_length
-            absolute_chat = chat.messages_between(chunk_start_epoch, chunk_end_epoch) if chat else []
-            chunk_chat = [{"t": item["epoch"] - chunk_start_epoch,
-                           "user": item["user"], "text": item["text"]} for item in absolute_chat]
-            chunk_moment_source = a.moment_source
-            if chunk_moment_source in {"chat", "combined"} and not chunk_chat:
-                chunk_moment_source = "audio"
-                if a.moment_source == "chat" and chat:
-                    print("  no live chat messages for this chunk; using audio/speech instead")
-            moments, words = pick_moments(c, a.clip_len, a.top, a.min_score, a.lead_in,
-                                          chunk_chat, chunk_moment_source)
-            for score, start in moments:
+                if any(abs(cand["global_start"] - s["global_start"]) < a.clip_len for s in selected):
+                    continue
+                selected.append(cand)
+
+            print(f"\n--- Global Ranking Complete ---")
+            print(f"Total candidates found: {len(candidates)} | Selected Top {len(selected)} moments:")
+            for i, s in enumerate(selected):
+                mins, secs = int(s["global_start"] // 60), int(s["global_start"] % 60)
+                print(f"  #{i+1}: Score {s['score']} at {mins:02d}:{secs:02d}")
+
+            print("\nRendering selected top clips ...")
+            for cand in selected:
+                c = cand["chunk"]
+                start = cand["start"]
+                score = cand["score"]
+                words = cand["words"]
+                chunk_chat = cand["chunk_chat"]
+                chunk_moment_source = cand["chunk_moment_source"]
+
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 name = f"gta-{stamp}-{n_clips + 1}"
                 mp4 = os.path.join(out_dir, name + ".mp4")
-                layout = "split" if a.split else ("fill" if a.crop else a.layout)
-                crop_offset, source_roi, facecam_roi = (
-                    detect_smart_frame(c, start, a.clip_len)
-                    if layout in {"fill", "split"}
-                    else (0.5, None, None)
-                )
+                layout_req = "split" if a.split else ("fill" if a.crop else a.layout)
+                crop_offset, source_roi, facecam_roi = detect_smart_frame(c, start, a.clip_len)
+                ws = [w for w in words if start <= w[0] < start + a.clip_len]
+                chat_summary = summarize_chat_window(chunk_chat, start, a.clip_len)
+                if layout_req == "auto":
+                    reaction = reaction_score(ws)
+                    layout = decide_layout(facecam_roi, source_roi, reaction, chat_summary, len(ws))
+                else:
+                    layout = layout_req
+                    if layout not in {"fill", "split"}:
+                        crop_offset, source_roi, facecam_roi = (0.5, None, None)
                 smart_crop = layout in {"fill", "split"}
                 pan_keys = None
                 if smart_crop and source_roi is None:
                     from player_track import track_player
                     pan_keys = track_player(c, start, a.clip_len)
-                    if pan_keys is None:                  # driving / cutscene: the car sits mid-frame
+                    if pan_keys is None:
                         crop_offset = 0.5
                 caption_margin_v = caption_margin_for_video(c, crop=smart_crop, source_roi=None if smart_crop else source_roi, layout=layout)
                 if cut(c, words, start, a.clip_len, mp4, who.get("credit"), crop=smart_crop,
@@ -826,8 +934,7 @@ def main():
                        caption_margin_v=caption_margin_v, layout=layout, pan_keys=pan_keys,
                        facecam_roi=facecam_roi, burn_credit=a.burn_credit):
                     n_clips += 1
-                    text = " ".join(w[2] for w in words if start <= w[0] < start + a.clip_len)
-                    chat_summary = summarize_chat_window(chunk_chat, start, a.clip_len)
+                    text = " ".join(w[2] for w in ws)
                     if chunk_moment_source == "chat":
                         selection_signals = ["live-chat"]
                     elif chunk_moment_source == "combined":
@@ -845,13 +952,15 @@ def main():
                             "caption_fallback_reason": getattr(words, "caption_fallback_reason", None),
                             "caption_position": "lower-third-of-visible-gameplay",
                             "framing": framing_name,
+                            "layout": layout,
+                            "layout_requested": layout_req,
                             "gameplay_confirmed": a.gameplay_confirmed,
                             "moment_source_requested": a.moment_source,
                             "moment_source_used": chunk_moment_source,
                             "selection_signals": selection_signals,
                             "live_chat_source": chat_source,
-                            "live_chat_status": chat.status if chat else "unavailable",
-                            "chat_fallback_reason": (chat.error if chat and chat.status == "unavailable" else chat_fallback) if not chat or chat.status == "unavailable" else None,
+                            "live_chat_status": "loaded" if vod_chat_messages else "unavailable",
+                            "chat_fallback_reason": chat_fallback,
                             "chat_message_count": chat_summary["message_count"],
                             "unique_chatters": chat_summary["unique_chatters"],
                             "reaction_chatters": chat_summary["reaction_chatters"],
@@ -863,17 +972,109 @@ def main():
                             "instagram_caption": None, "hashtags": [], "tags": [], "youtube_tags": [], "post_at": None,
                             "approved": False, "posted": {}, "test": who["test"],
                         }, meta, indent=2, ensure_ascii=False)
-                    print(f"  clip {name}.mp4  score {score}")
-                    if a.max_clips > 0 and n_clips >= a.max_clips:
+                    print(f"  rendered clip #{n_clips}: {name}.mp4  score {score}")
+        else:
+            while True:
+                chunks = sorted(glob.glob(os.path.join(wdir, "chunk_*.ts")))
+                finished = chunks if rec.poll() is not None else chunks[:-1]
+                todo = [c for c in finished if c not in done]
+                if not todo:
+                    if rec.poll() is not None:
                         break
-            if a.max_clips > 0 and n_clips >= a.max_clips:
-                print(f"reached target of {a.max_clips} clip(s); stopping capture ...")
-                break
-            for old in glob.glob(os.path.join(wdir, "chunk_*.ts")):
-                if old in done and time.time() - os.path.getmtime(old) > a.keep_minutes * 60:
-                    os.remove(old)
-            if chat:
-                chat.discard_before(chunk_end_epoch - 5)
+                    time.sleep(3)
+                    continue
+                c = todo[0]; done.add(c)
+                print(f"analysing {os.path.basename(c)} ...")
+                chunk_length = media_duration(c)
+                chunk_end_epoch = os.path.getmtime(c)
+                chunk_start_epoch = chunk_end_epoch - chunk_length
+                absolute_chat = chat.messages_between(chunk_start_epoch, chunk_end_epoch) if chat else []
+                chunk_chat = [{"t": item["epoch"] - chunk_start_epoch,
+                               "user": item["user"], "text": item["text"]} for item in absolute_chat]
+                chunk_moment_source = a.moment_source
+                if chunk_moment_source in {"chat", "combined"} and not chunk_chat:
+                    chunk_moment_source = "audio"
+                    if a.moment_source == "chat" and chat:
+                        print("  no live chat messages for this chunk; using audio/speech instead")
+                moments, words = pick_moments(c, a.clip_len, a.top, a.min_score, a.lead_in,
+                                              chunk_chat, chunk_moment_source)
+                for score, start in moments:
+                    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    name = f"gta-{stamp}-{n_clips + 1}"
+                    mp4 = os.path.join(out_dir, name + ".mp4")
+                    layout_req = "split" if a.split else ("fill" if a.crop else a.layout)
+                    crop_offset, source_roi, facecam_roi = detect_smart_frame(c, start, a.clip_len)
+                    ws = [w for w in words if start <= w[0] < start + a.clip_len]
+                    chat_summary = summarize_chat_window(chunk_chat, start, a.clip_len)
+                    if layout_req == "auto":
+                        reaction = reaction_score(ws)
+                        layout = decide_layout(facecam_roi, source_roi, reaction, chat_summary, len(ws))
+                    else:
+                        layout = layout_req
+                        if layout not in {"fill", "split"}:
+                            crop_offset, source_roi, facecam_roi = (0.5, None, None)
+                    smart_crop = layout in {"fill", "split"}
+                    pan_keys = None
+                    if smart_crop and source_roi is None:
+                        from player_track import track_player
+                        pan_keys = track_player(c, start, a.clip_len)
+                        if pan_keys is None:                  # driving / cutscene: the car sits mid-frame
+                            crop_offset = 0.5
+                    caption_margin_v = caption_margin_for_video(c, crop=smart_crop, source_roi=None if smart_crop else source_roi, layout=layout)
+                    if cut(c, words, start, a.clip_len, mp4, who.get("credit"), crop=smart_crop,
+                           crop_offset=crop_offset, source_roi=source_roi,
+                           caption_margin_v=caption_margin_v, layout=layout, pan_keys=pan_keys,
+                           facecam_roi=facecam_roi, burn_credit=a.burn_credit):
+                        n_clips += 1
+                        text = " ".join(w[2] for w in ws)
+                        if chunk_moment_source == "chat":
+                            selection_signals = ["live-chat"]
+                        elif chunk_moment_source == "combined":
+                            selection_signals = ["audio", "speech", "live-chat"]
+                        else:
+                            selection_signals = ["audio", "speech"]
+                        framing_name = "split-creator-gameplay" if (layout == "split" and facecam_roi) else ("fill-9x16" if smart_crop else "full-source-blur-fill")
+                        with open(os.path.join(out_dir, name + ".json"), "w", encoding="utf-8") as meta:
+                            json.dump({
+                                "video": name + ".mp4", "channel": "gta", "channel_target": target_channel, "source_url": a.url or a.file,
+                                "streamer": who["name"], "credit": who.get("credit"), "stream_title": title,
+                                "score": score, "transcript": text,
+                                "spoken_language": getattr(words, "spoken_language", "unknown"),
+                                "caption_language": getattr(words, "caption_language", "English"),
+                                "caption_fallback_reason": getattr(words, "caption_fallback_reason", None),
+                                "caption_position": "lower-third-of-visible-gameplay",
+                                "framing": framing_name,
+                                "layout": layout,
+                                "layout_requested": layout_req,
+                                "gameplay_confirmed": a.gameplay_confirmed,
+                                "moment_source_requested": a.moment_source,
+                                "moment_source_used": chunk_moment_source,
+                                "selection_signals": selection_signals,
+                                "live_chat_source": chat_source,
+                                "live_chat_status": chat.status if chat else "unavailable",
+                                "chat_fallback_reason": (chat.error if chat and chat.status == "unavailable" else chat_fallback) if not chat or chat.status == "unavailable" else None,
+                                "chat_message_count": chat_summary["message_count"],
+                                "unique_chatters": chat_summary["unique_chatters"],
+                                "reaction_chatters": chat_summary["reaction_chatters"],
+                                "crop_offset": crop_offset if smart_crop else None,
+                                "player_track": [[round(t, 2), round(x, 3)] for t, x in pan_keys] if pan_keys else None,
+                                "source_roi": list(source_roi) if source_roi else None,
+                                "facecam_roi": list(facecam_roi) if facecam_roi else None,
+                                "title": None, "youtube_description": None,
+                                "instagram_caption": None, "hashtags": [], "tags": [], "youtube_tags": [], "post_at": None,
+                                "approved": False, "posted": {}, "test": who["test"],
+                            }, meta, indent=2, ensure_ascii=False)
+                        print(f"  clip {name}.mp4  score {score}")
+                        if a.max_clips > 0 and n_clips >= a.max_clips:
+                            break
+                if a.max_clips > 0 and n_clips >= a.max_clips:
+                    print(f"reached target of {a.max_clips} clip(s); stopping capture ...")
+                    break
+                for old in glob.glob(os.path.join(wdir, "chunk_*.ts")):
+                    if old in done and time.time() - os.path.getmtime(old) > a.keep_minutes * 60:
+                        os.remove(old)
+                if chat:
+                    chat.discard_before(chunk_end_epoch - 5)
     except KeyboardInterrupt:
         print("stopping capture; finishing current work ...")
     finally:

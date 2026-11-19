@@ -12,7 +12,11 @@ The software is free and MIT-licensed. The optional AI workflow guide and prompt
 - Starts clips a few seconds before the detected highlight (6 seconds by default).
 - Captions English speech in English and Hindi speech in romanized Hinglish. Other or uncertain languages, including Hindi the recognizer returns in an unsupported script, have no captions. Captions are short one-line phrases (up to 3 words) at one fixed spot: each word pops in yellow when it is spoken, earlier words turn white, and the next phrase replaces the last one in the same place (never stacked). Source audio stays unchanged.
 - Places captions in the lower third of the visible gameplay panel instead of using one fixed position near the bottom of the full vertical canvas.
-- Fills the whole 9:16 screen with gameplay by default (`--layout fill`), centered on the player. It samples frames for facecams, shifts the crop away from a persistent side facecam, and in stacked portrait streams cuts out the facecam and fills the screen with the gameplay part. `--layout fit` keeps the old look: the full source in the middle over a blurred background.
+- Intelligently chooses vertical framing per clip (`--layout auto` by default):
+  - **`split`** (creator facecam on top, gameplay on bottom): triggered when a webcam is present and the moment is high-reaction (high reaction score, hype words, or chat burst).
+  - **`fill`** (full 9:16 vertical gameplay): used when no webcam is detected, or during pure action/driving moments so gameplay covers the entire phone screen.
+  - **`fit`** (cinematic gameplay over blurred background): triggered when wide letterboxed cutscenes (21:9 black bars) are detected.
+  - Manual overrides `--layout fill`, `--layout split`, and `--layout fit` remain available.
 - Resets audio and video timestamps before burning the captions.
 - Masks swear words and sexual words in the burned-in captions (for example `s***`) so platforms do not limit the clip; the original audio is unchanged.
 - Saves MP4 and JSON metadata in stream-separated folders under `output/` (named by capture date and channel, e.g. `output/<YYYYMMDD-HHMMSS>_<channelName>_<videoId>/`). It never posts as part of clipping.
@@ -39,10 +43,22 @@ The YouTube API returns live search candidates in `viewCount` order. It is not a
 
 ## Make clips
 
-Open the candidate stream and verify that actual GTA gameplay is visible in the video. A GTA title, thumbnail, or talking head is not enough. Then start capture and keep it running until you press Ctrl+C. The default is chat-first. If chat is unavailable or has no messages for a chunk, the clipper automatically uses audio and speech instead. The clipper writes each selected highlight to `output/`:
+### Live Stream Mode (Real-time capture)
+Open the candidate stream and verify that actual GTA gameplay is visible in the video. Then start capture:
 
 ```powershell
-python clip.py "https://www.youtube.com/watch?v=VIDEO_ID" --gameplay-confirmed --max-seconds 0 --clip-len 30 --lead-in 6 --top 2
+python clip.py "https://www.youtube.com/watch?v=VIDEO_ID" --channel english --gameplay-confirmed --clip-len 30 --lead-in 6 --top 2
+```
+
+### Full Video / VOD Mode (Completed streams & local files)
+To process an entire ended live stream or local video from start to finish, download chat replay via `yt-dlp`, and extract the globally ranked Top 5 moments:
+
+```powershell
+# For ended YouTube stream:
+python clip.py "https://www.youtube.com/watch?v=VIDEO_ID" --vod --channel english --gameplay-confirmed --max-clips 5 --min-score 3.5
+
+# For local file:
+python clip.py --file "C:\videos\full_stream.mp4" --vod --channel hindi --max-clips 5 --min-score 3.5
 ```
 
 Important options:
@@ -56,12 +72,13 @@ Important options:
 | `--top` | `1` | Highlights kept from each chunk |
 | `--gameplay-confirmed` | required for live capture | Confirm you inspected the stream and saw actual gameplay before recording |
 | `--min-score` | `2.5` | Minimum moment score |
-| `--layout` | `fill` | `fill`: gameplay covers the full 9:16 screen, facecam shifted away; `fit`: full source in the middle over a blurred background; `split`: creator facecam cropped on top, gameplay on bottom |
+| `--layout` | `auto` | `auto` (default): intelligent selector switching between `split`, `fill`, and `fit`; `fill`: gameplay covers full 9:16 screen; `fit`: full source over blurred background; `split`: creator facecam cropped on top, gameplay on bottom |
 | `--split` | off | Shortcut for `--layout split` (creator facecam on top, gameplay on bottom) |
 | `--crop` | off | Old flag, same as `--layout fill` |
 | `--moment-source` | `chat` | Choose `chat`, `combined`, or `audio` for highlight selection |
 | `--spoken-language` | `auto` | `auto` detects the language and locks to Hindi (Hinglish captions) once a stream is clearly Hindi. `hi` / `en` force it for the whole stream |
 | `--channel` / `--lang` | `english` | Target channel: `english` (saves to `output/english/<date>_<streamer>/`) or `hindi` (saves to `output/hindi/<date>_<streamer>/`) |
+| `--vod` | off | VOD mode: process full completed video/stream, fetch chat replay via yt-dlp, globally rank moments across the entire video, and render top highlights directly to output |
 | `--no-chat` | off | Skip live-chat collection and use audio and speech only |
 | `--output-dir` | auto | Custom destination folder (overrides default hierarchy) |
 | `--burn-credit` | off | Burn `via <creator>` watermark on the video for 4s (default off; creator credit is placed in post captions) |

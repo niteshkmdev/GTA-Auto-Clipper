@@ -264,3 +264,67 @@ def create_live_chat_collector(url, video_id=None, environ=None):
             return None, "unavailable", "could not read Twitch channel from URL"
         return TwitchChatCollector(channel, username, token), "twitch-chat", None
     return None, "unsupported", "this platform has no live-chat connector"
+
+
+def parse_yt_dlp_chat(file_path):
+    """Parse a .live_chat.json downloaded by yt-dlp into standardized chat dicts."""
+    messages = []
+    if not os.path.isfile(file_path):
+        return messages
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            action = data.get("replayChatItemAction", {})
+            offset_msec = action.get("videoOffsetTimeMsec")
+            if offset_msec is None:
+                continue
+            try:
+                t = float(offset_msec) / 1000.0
+            except (ValueError, TypeError):
+                continue
+            for a in action.get("actions", []):
+                item = (a.get("addChatItemAction") or {}).get("item", {})
+                renderer = item.get("liveChatTextMessageRenderer") or item.get("liveChatPaidMessageRenderer")
+                if not renderer:
+                    continue
+                author = (renderer.get("authorName") or {}).get("simpleText") or "unknown"
+                msg_obj = renderer.get("message") or {}
+                runs = msg_obj.get("runs", [])
+                text = "".join(r.get("text", "") for r in runs if isinstance(r, dict)) or msg_obj.get("simpleText", "")
+                if text:
+                    messages.append({"t": round(t, 2), "user": author, "text": text})
+    messages.sort(key=lambda m: m["t"])
+    return messages
+
+
+def download_chat_replay(url, out_dir):
+    """Use yt-dlp to download YouTube live chat replay for completed broadcasts."""
+    import shutil
+    import subprocess
+    import glob
+    import sys
+
+    os.makedirs(out_dir, exist_ok=True)
+    target_prefix = os.path.join(out_dir, "chat_replay")
+    cmd = [sys.executable, "-m", "yt_dlp", "--skip-download", "--write-subs",
+           "--sub-langs", "live_chat", "--no-warnings", "-o", target_prefix, url]
+    if not shutil.which("deno"):
+        for rt in ("node", "bun"):
+            if shutil.which(rt):
+                cmd += ["--js-runtimes", rt]
+                break
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+
+    candidates = glob.glob(os.path.join(out_dir, "*.live_chat.json"))
+    if candidates:
+        return parse_yt_dlp_chat(candidates[0])
+    return []

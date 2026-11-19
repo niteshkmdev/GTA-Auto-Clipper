@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 from clip import (
     write_ass,
     build_video_filter, choose_crop_offset, choose_vertical_game_roi, choose_facecam_box, gameplay_crop_offset, reaction_score,
+    decide_layout,
     should_apply_smart_crop,
     source_identity, select_clip_start,
     DEFAULT_MAX_SECONDS, pick_moments, mask_word, ytdlp_cmd,
@@ -58,6 +59,33 @@ class ClipperReleaseTests(unittest.TestCase):
     def test_fill_layout_with_a_gameplay_roi_still_fills_the_screen(self):
         graph = build_video_filter('captions.ass', layout='fill', source_roi=(0, 150, 360, 389))
         self.assertTrue(graph.startswith('[0:v]crop=360:389:0:150,scale=1080:1920:force_original_aspect_ratio=increase'))
+
+    def test_decide_layout_chooses_fit_for_cinematic_letterbox(self):
+        self.assertEqual(decide_layout(facecam_roi=(0, 0, 480, 300), source_roi=(0, 140, 1920, 800)), "fit")
+
+    def test_decide_layout_chooses_fill_when_no_facecam_exists(self):
+        self.assertEqual(decide_layout(facecam_roi=None, reaction_score=2.5, chat_summary={"reaction_chatters": 10}), "fill")
+
+    def test_decide_layout_chooses_split_on_high_reaction_score(self):
+        self.assertEqual(decide_layout(facecam_roi=(0, 0, 480, 300), reaction_score=1.2), "split")
+
+    def test_decide_layout_chooses_split_on_chat_reaction_burst(self):
+        self.assertEqual(decide_layout(facecam_roi=(0, 0, 480, 300), reaction_score=0.1, chat_summary={"reaction_chatters": 4}), "split")
+
+    def test_decide_layout_chooses_split_on_dense_commentary_with_reaction(self):
+        self.assertEqual(decide_layout(facecam_roi=(0, 0, 480, 300), reaction_score=0.45, words_count=16), "split")
+
+    def test_decide_layout_chooses_fill_for_action_or_calm_gameplay(self):
+        self.assertEqual(decide_layout(facecam_roi=(0, 0, 480, 300), reaction_score=0.1, chat_summary={"reaction_chatters": 1}, words_count=4), "fill")
+
+    def test_build_video_filter_auto_defaults_to_split_with_facecam(self):
+        graph = build_video_filter('captions.ass', layout='auto', facecam_roi=(0, 0, 480, 300))
+        self.assertIn('vstack=inputs=2', graph)
+
+    def test_build_video_filter_auto_defaults_to_fill_without_facecam(self):
+        graph = build_video_filter('captions.ass', layout='auto', facecam_roi=None)
+        self.assertNotIn('vstack', graph)
+        self.assertIn('force_original_aspect_ratio=increase,crop=1080:1920', graph)
         self.assertNotIn('boxblur', graph)
 
     def test_gameplay_crop_centres_the_over_the_shoulder_player_anchor(self):
