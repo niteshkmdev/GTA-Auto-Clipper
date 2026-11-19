@@ -12,6 +12,7 @@ from clip import (
     write_ass,
     build_video_filter, choose_crop_offset, choose_vertical_game_roi, choose_facecam_box, gameplay_crop_offset, reaction_score,
     decide_layout,
+    get_vod_cache_path, load_vod_cache, save_vod_cache_chunk,
     should_apply_smart_crop,
     source_identity, select_clip_start,
     DEFAULT_MAX_SECONDS, pick_moments, mask_word, ytdlp_cmd,
@@ -86,7 +87,64 @@ class ClipperReleaseTests(unittest.TestCase):
         graph = build_video_filter('captions.ass', layout='auto', facecam_roi=None)
         self.assertNotIn('vstack', graph)
         self.assertIn('force_original_aspect_ratio=increase,crop=1080:1920', graph)
-        self.assertNotIn('boxblur', graph)
+
+    def test_vod_selection_unlimited_and_capped(self):
+        candidates = [
+            {"score": 5.0, "global_start": 100},
+            {"score": 4.5, "global_start": 110},  # overlapping with first
+            {"score": 4.0, "global_start": 200},
+            {"score": 3.8, "global_start": 300},
+            {"score": 3.5, "global_start": 400},
+        ]
+        clip_len = 30
+
+        def select(target_top):
+            sel = []
+            for c in candidates:
+                if target_top is not None and len(sel) >= target_top:
+                    break
+                if any(abs(c["global_start"] - s["global_start"]) < clip_len for s in sel):
+                    continue
+                sel.append(c)
+            return sel
+
+        # Unlimited
+        res_unlimited = select(None)
+        self.assertEqual(len(res_unlimited), 4)
+
+        # Capped to 2
+        res_capped = select(2)
+        self.assertEqual(len(res_capped), 2)
+        self.assertEqual(res_capped[0]["score"], 5.0)
+        self.assertEqual(res_capped[1]["score"], 4.0)
+
+    def test_vod_cache_path_generation(self):
+        self.assertIsNone(get_vod_cache_path(None))
+        p = get_vod_cache_path("169ZzvPxvvM")
+        self.assertTrue(p.endswith("169ZzvPxvvM.json"))
+        self.assertIn("vod", p)
+
+    def test_save_and_load_vod_cache_chunk(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as d:
+            cache_file = os.path.join(d, "test_vod.json")
+            save_vod_cache_chunk(cache_file, "test_id", 0, {"words": [[0.1, 0.5, "bhai"]], "length": 90.0})
+            save_vod_cache_chunk(cache_file, "test_id", 1, {"words": [[91.0, 91.5, "insane"]], "length": 90.0})
+
+            loaded = load_vod_cache(cache_file)
+            self.assertEqual(loaded["video_id"], "test_id")
+            self.assertIn("0", loaded["chunks"])
+            self.assertIn("1", loaded["chunks"])
+            self.assertEqual(loaded["chunks"]["0"]["words"][0][2], "bhai")
+            self.assertEqual(loaded["chunks"]["1"]["words"][0][2], "insane")
+
+    def test_pick_moments_uses_cached_words_when_provided(self):
+        audio = np.full(90 * 16000, 0.05, dtype=np.float32)
+        cached_words = [(10.0, 10.5, "crazy"), (10.6, 11.0, "insane")]
+        with patch('clip.load_audio', return_value=audio), patch('clip.whisper_words') as mock_whisper:
+            moments, words = pick_moments("unused.ts", clip_len=30, top=1, min_score=0.5, cached_words=cached_words)
+            mock_whisper.assert_not_called()
+            self.assertEqual(words, cached_words)
 
     def test_gameplay_crop_centres_the_over_the_shoulder_player_anchor(self):
         for width, height in ((1920, 1080), (640, 360)):

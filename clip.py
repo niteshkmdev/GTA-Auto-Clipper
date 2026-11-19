@@ -22,6 +22,42 @@ REACTION_PHRASES = {
 }
 DEFAULT_MIN_SCORE = 2.5
 FACE_MODEL = os.path.join(HERE, "models", "face_detection_yunet_2023mar.onnx")
+CACHE_DIR = os.path.join(HERE, "cache", "vod")
+
+
+def get_vod_cache_path(video_id):
+    if not video_id:
+        return None
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    clean_id = re.sub(r"[^\w-]+", "_", str(video_id)).strip("_")
+    return os.path.join(CACHE_DIR, f"{clean_id}.json")
+
+
+def load_vod_cache(cache_path):
+    if cache_path and os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_vod_cache_chunk(cache_path, video_id, chunk_idx, chunk_data):
+    if not cache_path:
+        return
+    try:
+        data = load_vod_cache(cache_path)
+        if "video_id" not in data:
+            data["video_id"] = video_id
+            data["chunks"] = {}
+        data.setdefault("chunks", {})[str(chunk_idx)] = chunk_data
+        tmp_path = cache_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, cache_path)
+    except Exception as e:
+        print(f"warning: could not save vod cache chunk: {e}")
 
 
 def ytdlp_cmd(*args):
@@ -243,12 +279,12 @@ def select_clip_start(anchor, lead_in, clip_len, duration):
 
 
 def pick_moments(chunk_path, clip_len, top, min_score, lead_in=6, chat_messages=None,
-                 moment_source="combined"):
+                 moment_source="combined", cached_words=None):
     audio = load_audio(chunk_path)
     if len(audio) < 16000:
         return [], []
     db = rms_series(audio)
-    words = whisper_words(audio)
+    words = cached_words if cached_words is not None else whisper_words(audio)
     hop = 0.25
     med = np.median(db); mad = np.median(np.abs(db - med)) + 1.0
     spike = (db - med) / mad
@@ -762,10 +798,19 @@ def main():
                     help="VOD mode: process full completed video or stream, download live-chat replay, globally rank all moments, and extract the top highlights")
     ap.add_argument("--burn-credit", action="store_true",
                     help="burn 'via <creator>' text on the video for the first 4s (default: False; credit belongs in post captions)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="ignore existing VOD analysis cache and re-analyze all chunks")
     ap.add_argument("--output-dir", default=None, help="override the output folder")
     a = ap.parse_args()
     global _forced_language
-    _forced_language = None if a.spoken_language == "auto" else a.spoken_language
+    if a.spoken_language != "auto":
+        _forced_language = a.spoken_language
+    elif a.channel == "hindi":
+        _forced_language = "hi"
+    elif a.channel == "english":
+        _forced_language = "en"
+    else:
+        _forced_language = None
     if not a.url and not a.file:
         sys.exit(__doc__)
     if a.file and not a.test and not a.vod:
@@ -795,6 +840,9 @@ def main():
     clean_channel = re.sub(r"[^\w-]+", "_", who.get("name") or "stream").strip("_")
     stream_folder = f"{start_stamp}_{clean_channel}"
     video_id = info.get("id")
+    if not video_id and a.file:
+        import hashlib
+        video_id = hashlib.md5(a.file.encode()).hexdigest()[:12]
     if video_id:
         stream_folder += f"_{video_id}"
 
@@ -840,10 +888,17 @@ def main():
     done, n_clips = set(), 0
     try:
         if a.vod:
-            target_top = a.max_clips if a.max_clips > 0 else "all qualifying"
-            print(f"VOD mode active: scanning full source, will select {target_top} moments globally...")
+            target_top = a.max_clips if a.max_clips > 0 else None
+            top_label = f"Top {a.max_clips}" if a.max_clips > 0 else "all qualifying"
+            print(f"VOD mode active: scanning full source, will select {top_label} moments globally...")
+            cache_path = get_vod_cache_path(video_id) if not a.no_cache else None
+            vod_cache = load_vod_cache(cache_path) if cache_path else {}
+            cached_chunks = vod_cache.get("chunks", {})
+            if cached_chunks:
+                print(f"loaded persistent VOD cache: {len(cached_chunks)} chunk(s) already transcribed")
             candidates = []
             current_offset = 0.0
+            chunk_idx = 0
             while True:
                 chunks = sorted(glob.glob(os.path.join(wdir, "chunk_*.ts")))
                 finished = chunks if rec.poll() is not None else chunks[:-1]
@@ -867,9 +922,34 @@ def main():
                 if chunk_moment_source in {"chat", "combined"} and not chunk_chat:
                     chunk_moment_source = "audio"
 
+                # Check persistent cache for this chunk
+                cached_data = cached_chunks.get(str(chunk_idx))
+                cached_words = None
+                from_cache = False
+                if cached_data and "words" in cached_data:
+                    raw_w = [(w[0], w[1], w[2]) for w in cached_data["words"]]
+                    cached_words = WordTimings(
+                        raw_w,
+                        spoken_language=cached_data.get("spoken_language", "unknown"),
+                        caption_language=cached_data.get("caption_language", "English"),
+                        caption_fallback_reason=cached_data.get("caption_fallback_reason"),
+                    )
+                    from_cache = True
+
                 scan_top = max(3, a.top)
                 moments, words = pick_moments(c, a.clip_len, scan_top, a.min_score, a.lead_in,
-                                              chunk_chat, chunk_moment_source)
+                                              chunk_chat, chunk_moment_source, cached_words=cached_words)
+
+                if not from_cache and cache_path:
+                    save_vod_cache_chunk(cache_path, video_id, chunk_idx, {
+                        "start_time": chunk_start_time,
+                        "length": chunk_length,
+                        "spoken_language": getattr(words, "spoken_language", "unknown"),
+                        "caption_language": getattr(words, "caption_language", "English"),
+                        "caption_fallback_reason": getattr(words, "caption_fallback_reason", None),
+                        "words": [[round(w[0], 3), round(w[1], 3), w[2]] for w in words],
+                    })
+
                 for score, start in moments:
                     candidates.append({
                         "score": score,
@@ -880,13 +960,15 @@ def main():
                         "chunk_chat": chunk_chat,
                         "chunk_moment_source": chunk_moment_source,
                     })
-                print(f"  scanned chunk {len(done)} ({chunk_start_time/60:.1f}m - {current_offset/60:.1f}m): found {len(moments)} candidate moment(s)")
+                source_tag = " (from cache)" if from_cache else ""
+                print(f"  scanned chunk {chunk_idx + 1}{source_tag} ({chunk_start_time/60:.1f}m - {current_offset/60:.1f}m): found {len(moments)} candidate moment(s)")
+                chunk_idx += 1
 
             # Global ranking across all candidates
             candidates.sort(key=lambda item: item["score"], reverse=True)
             selected = []
             for cand in candidates:
-                if len(selected) >= target_top:
+                if target_top is not None and len(selected) >= target_top:
                     break
                 if any(abs(cand["global_start"] - s["global_start"]) < a.clip_len for s in selected):
                     continue
