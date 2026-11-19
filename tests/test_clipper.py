@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 
 from clip import (
     write_ass,
-    build_video_filter, choose_crop_offset, choose_vertical_game_roi, gameplay_crop_offset, reaction_score,
+    build_video_filter, choose_crop_offset, choose_vertical_game_roi, choose_facecam_box, gameplay_crop_offset, reaction_score,
     should_apply_smart_crop,
     source_identity, select_clip_start,
     DEFAULT_MAX_SECONDS, pick_moments, mask_word, ytdlp_cmd,
@@ -18,6 +18,32 @@ from clip import (
 
 
 class ClipperReleaseTests(unittest.TestCase):
+    def test_split_layout_stacks_creator_facecam_and_gameplay(self):
+        graph = build_video_filter('captions.ass', layout='split', facecam_roi=(0, 0, 480, 300))
+        self.assertIn('vstack=inputs=2', graph)
+        self.assertIn('crop=480:300:0:0', graph)
+        self.assertIn('scale=1080:680', graph)
+        self.assertIn('ass=captions.ass', graph)
+
+    def test_split_layout_falls_back_to_fill_when_no_facecam_is_found(self):
+        graph = build_video_filter('captions.ass', layout='split', facecam_roi=None)
+        self.assertNotIn('vstack', graph)
+        self.assertIn('force_original_aspect_ratio=increase,crop=1080:1920', graph)
+
+    def test_choose_facecam_box_detects_corner_webcam(self):
+        samples = [[(100, 80, 80, 90)] for _ in range(5)]
+        box = choose_facecam_box(1920, 1080, samples)
+        self.assertIsNotNone(box)
+        x, y, w, h = box
+        self.assertEqual(x, 0)
+        self.assertEqual(y, 0)
+        self.assertGreater(w, 0)
+        self.assertGreater(h, 0)
+
+    def test_choose_facecam_box_ignores_center_in_game_faces(self):
+        samples = [[(960, 540, 100, 120)] for _ in range(5)]
+        self.assertIsNone(choose_facecam_box(1920, 1080, samples))
+
     def test_fit_layout_keeps_the_full_source_over_a_blurred_background(self):
         graph = build_video_filter('captions.ass', layout='fit')
         self.assertIn('[b]scale=1080:-2[fg]', graph)
@@ -162,6 +188,20 @@ class PopCaptionTests(unittest.TestCase):
             import re
             visible = re.sub(r"\{[^}]*\}", "", e.split(",,", 2)[-1].split(",,")[-1])
             self.assertLessEqual(len(visible), 24)
+
+    def test_video_credit_omitted_by_default_and_present_only_when_requested(self):
+        import tempfile, os
+        from clip import WordTimings, write_ass
+        with tempfile.TemporaryDirectory() as d:
+            path_default = os.path.join(d, "default.ass")
+            write_ass(path_default, WordTimings([], "en", "English"), 0, 30, "IShowSpeed")
+            content_default = open(path_default, encoding="utf-8").read()
+            self.assertNotIn("via IShowSpeed", content_default)
+
+            path_burned = os.path.join(d, "burned.ass")
+            write_ass(path_burned, WordTimings([], "en", "English"), 0, 30, "IShowSpeed", burn_credit=True)
+            content_burned = open(path_burned, encoding="utf-8").read()
+            self.assertIn("via IShowSpeed", content_burned)
 
 
 if __name__ == '__main__':

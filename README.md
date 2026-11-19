@@ -56,12 +56,14 @@ Important options:
 | `--top` | `1` | Highlights kept from each chunk |
 | `--gameplay-confirmed` | required for live capture | Confirm you inspected the stream and saw actual gameplay before recording |
 | `--min-score` | `2.5` | Minimum moment score |
-| `--layout` | `fill` | `fill`: gameplay covers the full 9:16 screen, facecams cropped out. `fit`: full source in the middle over a blurred background |
+| `--layout` | `fill` | `fill`: gameplay covers the full 9:16 screen, facecam shifted away; `fit`: full source in the middle over a blurred background; `split`: creator facecam cropped on top, gameplay on bottom |
+| `--split` | off | Shortcut for `--layout split` (creator facecam on top, gameplay on bottom) |
 | `--crop` | off | Old flag, same as `--layout fill` |
 | `--moment-source` | `chat` | Choose `chat`, `combined`, or `audio` for highlight selection |
 | `--spoken-language` | `auto` | `auto` detects the language and locks to Hindi (Hinglish captions) once a stream is clearly Hindi. `hi` / `en` force it for the whole stream |
 | `--no-chat` | off | Skip live-chat collection and use audio and speech only |
 | `--output-dir` | `output/<date>_<channel>/` | Custom destination folder |
+| `--burn-credit` | off | Burn `via <creator>` watermark on the video for 4s (default off; creator credit is placed in post captions) |
 
 Examples: `--moment-source chat` uses chat reactions first; `--moment-source combined` scores chat, audio, and speech together; `--moment-source audio` uses the original audio and speech method. Chat mode falls back to audio and speech when it has no chat data.
 

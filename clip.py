@@ -304,14 +304,19 @@ def ass_time(t):
     return f"{h}:{m:02d}:{s:05.2f}"
 
 
-def caption_margin_for_video(video_path, crop=False, source_roi=None):
+def caption_margin_for_video(video_path, crop=False, source_roi=None, layout="fill"):
     """Place captions near the lower third of visible gameplay, not the blurred canvas edge."""
     output_width, output_height = 1080, 1920
-    if crop and not source_roi:
+    if layout == "split":
+        panel_top = 684
+        panel_height = 1236
+    elif crop and not source_roi:
         panel_height = output_height
+        panel_top = 0
     elif source_roi:
         _, _, source_width, source_height = source_roi
         panel_height = min(output_height, output_width * source_height / max(1, source_width))
+        panel_top = max(0, (output_height - panel_height) / 2)
     else:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
@@ -324,7 +329,7 @@ def caption_margin_for_video(video_path, crop=False, source_roi=None):
             panel_height = min(output_height, output_width * source_height / max(1, source_width))
         else:
             panel_height = output_height
-    panel_top = max(0, (output_height - panel_height) / 2)
+        panel_top = max(0, (output_height - panel_height) / 2)
     caption_center = panel_top + panel_height * 0.76
     baseline_offset = 55
     return max(100, min(1100, round(output_height - caption_center - baseline_offset)))
@@ -344,7 +349,7 @@ def mask_word(w):
     return w
 
 
-def write_ass(path, words, start, length, credit, caption_margin_v=400):
+def write_ass(path, words, start, length, credit=None, caption_margin_v=400, burn_credit=False):
     """Pop-up captions: a short phrase (max 3 words, one line) sits at ONE fixed spot. Each word pops in when it is
     spoken, in yellow with a small bounce; words already said turn white; words not yet said stay invisible, so the
     line never shifts. Events never overlap in time (overlapping events make libass stack lines on top of each other)."""
@@ -397,9 +402,10 @@ def write_ass(path, words, start, length, credit, caption_margin_v=400):
             chars = sum(len(p[2]) for p in phrase) + len(phrase) - 1
             fs = max(64, min(104, int(1000 / (0.74 * max(1, chars)))))   # big, but always one line on 1080 px
             ev.append(f"Dialogue: 0,{a_txt},{b_txt},Word,,0,0,0,,{{\\fs{fs}}}{' '.join(parts)}")
-    if credit:
+    if credit and burn_credit:
         ev.append(f"Dialogue: 1,{ass_time(0)},{ass_time(4)},Credit,,0,0,0,,via {credit}")
-    open(path, "w", encoding="utf-8").write(head + "\n".join(ev) + "\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(head + "\n".join(ev) + "\n")
 
 
 def gameplay_crop_offset(frame_width, frame_height, player_x=None):
@@ -477,27 +483,71 @@ def choose_vertical_game_roi(frame_width, frame_height, face_samples, active_bot
     return 0, y0, frame_width, y1 - y0
 
 
+def choose_facecam_box(frame_width, frame_height, face_samples, target_aspect=1080/680):
+    """Detect the streamer's persistent webcam overlay box.
+    Returns (x, y, w, h) in source frame coordinates, or None if no persistent facecam is found."""
+    if frame_width <= 0 or frame_height <= 0 or not face_samples:
+        return None
+    threshold = max(2, math.ceil(len(face_samples) * 0.25))
+    # Streamer face is typically in the corner / periphery, smaller than 20% width and 30% height
+    small = [b for d in face_samples for b in d
+             if len(b) >= 4 and 0 < b[2] < frame_width * 0.20 and 0 < b[3] < frame_height * 0.30]
+    if len(small) < threshold:
+        return None
+    cx = [b[0] + b[2] / 2 for b in small]
+    cy = [b[1] + b[3] / 2 for b in small]
+    mx, my = float(np.median(cx)), float(np.median(cy))
+    mw, mh = float(np.median([b[2] for b in small])), float(np.median([b[3] for b in small]))
+
+    stable = all(abs(x - mx) <= frame_width * 0.06 and abs(y - my) <= frame_height * 0.08 for x, y in zip(cx, cy))
+    in_center = (frame_width * 0.35 <= mx <= frame_width * 0.65) and (frame_height * 0.30 <= my <= frame_height * 0.70)
+    if not stable or in_center:
+        return None
+
+    # Scale face bounding box to include head, shoulders, and surrounding camera frame
+    cam_h = min(frame_height, max(int(mh * 2.8), int(frame_height * 0.28)))
+    cam_w = min(frame_width, int(cam_h * target_aspect))
+
+    cam_x = int(mx - cam_w / 2)
+    cam_y = int(my - cam_h / 2)
+
+    # Snap to corner edges if close to border
+    if mx < frame_width * 0.25:
+        cam_x = 0
+    elif mx > frame_width * 0.75:
+        cam_x = frame_width - cam_w
+
+    if my < frame_height * 0.25:
+        cam_y = 0
+    elif my > frame_height * 0.75:
+        cam_y = frame_height - cam_h
+
+    cam_x = max(0, min(frame_width - cam_w, cam_x))
+    cam_y = max(0, min(frame_height - cam_h, cam_y))
+    return cam_x, cam_y, cam_w, cam_h
+
+
 def should_apply_smart_crop(requested, crop_offset, source_roi):
     """Only crop when facecam evidence supports it; otherwise preserve the full source."""
     return bool(requested and (source_roi is not None or abs(float(crop_offset) - 0.5) > 0.01))
 
 
 def detect_smart_frame(video_path, start, length, sample_count=9):
-    """Detect a persistent facecam and return a safe horizontal offset or gameplay ROI."""
+    """Detect a persistent facecam and return a safe horizontal offset, gameplay ROI, and facecam bounding box."""
     try:
         import cv2
     except ImportError:
-        return 0.5, None
+        return 0.5, None, None
 
     if not os.path.isfile(FACE_MODEL):
-        return 0.5, None
+        return 0.5, None, None
     try:
         detector = cv2.FaceDetectorYN.create(FACE_MODEL, "", (320, 320), 0.8, 0.3, 5000)
     except cv2.error:
-        return 0.5, None
+        return 0.5, None, None
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return 0.5, None
+        return 0.5, None, None
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     samples = []
@@ -543,14 +593,43 @@ def detect_smart_frame(video_path, start, length, sample_count=9):
         if frame_height - 1 - row >= frame_height * 0.03:
             active_bottom = row + 1
     roi = choose_vertical_game_roi(frame_width, frame_height, samples, active_bottom)
-    return choose_crop_offset(frame_width, frame_height, samples), roi
+    facecam_box = choose_facecam_box(frame_width, frame_height, samples)
+    return choose_crop_offset(frame_width, frame_height, samples), roi, facecam_box
 
 
-def build_video_filter(ass_name, crop=False, crop_offset=0.5, source_roi=None, layout="fit", pan_keys=None):
+def build_video_filter(ass_name, crop=False, crop_offset=0.5, source_roi=None, layout="fit", pan_keys=None,
+                       facecam_roi=None):
     """layout "fill" (default in the CLI): gameplay covers the whole 9:16 frame, centered (or shifted away from a
-    side facecam). layout "fit": the full source sits in the middle over a blurred copy (old look)."""
+    side facecam). layout "fit": the full source sits in the middle over a blurred copy.
+    layout "split": creator facecam cropped on top, gameplay on bottom."""
     offset = min(1.0, max(0.0, float(crop_offset)))
-    if crop:
+    if crop and layout != "split":
+        layout = "fill"
+    if layout == "split":
+        if facecam_roi:
+            cam_h = 680
+            divider_h = 4
+            game_h = 1920 - cam_h - divider_h
+            fx, fy, fw, fh = facecam_roi
+            cam_pad_h = cam_h + divider_h
+            if pan_keys:
+                from player_track import crop_x_expr
+                expr = crop_x_expr(pan_keys, out_w=1080)
+                game_filter = (
+                    f"[0:v]setpts=PTS-STARTPTS,scale=-2:{game_h}:force_original_aspect_ratio=increase,"
+                    f"crop=1080:{game_h}:'{expr}':(ih-{game_h})/2[game];"
+                )
+            else:
+                game_filter = (
+                    f"[0:v]setpts=PTS-STARTPTS,scale=-2:{game_h}:force_original_aspect_ratio=increase,"
+                    f"crop=1080:{game_h}:(iw-1080)*{offset:.4f}:(ih-{game_h})/2[game];"
+                )
+            cam_filter = (
+                f"[0:v]crop={fw}:{fh}:{fx}:{fy},"
+                f"scale=1080:{cam_h}:force_original_aspect_ratio=increase,"
+                f"crop=1080:{cam_h},pad=1080:{cam_pad_h}:0:0:color=black[cam];"
+            )
+            return f"{cam_filter}{game_filter}[cam][game]vstack=inputs=2,setpts=PTS-STARTPTS,ass={ass_name}"
         layout = "fill"
     if layout == "fill":
         pre = ""
@@ -576,12 +655,15 @@ def build_video_filter(ass_name, crop=False, crop_offset=0.5, source_roi=None, l
 
 
 def cut(chunk_path, words, start, length, out_mp4, credit, crop=False, crop_offset=0.5,
-        source_roi=None, caption_margin_v=400, layout="fit", pan_keys=None):
+        source_roi=None, caption_margin_v=400, layout="fit", pan_keys=None, facecam_roi=None,
+        burn_credit=False):
     d = os.path.dirname(out_mp4)
     ass_name = "cap_" + os.path.basename(out_mp4) + ".ass"
-    write_ass(os.path.join(d, ass_name), words, start, length, credit, caption_margin_v)
+    if layout == "split" and facecam_roi:
+        caption_margin_v = min(caption_margin_v, 320)
+    write_ass(os.path.join(d, ass_name), words, start, length, credit, caption_margin_v, burn_credit=burn_credit)
     fg = build_video_filter(ass_name, crop=crop, crop_offset=crop_offset, source_roi=source_roi, layout=layout,
-                            pan_keys=pan_keys)
+                            pan_keys=pan_keys, facecam_roi=facecam_roi)
     r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}",
                         "-i", os.path.abspath(chunk_path), "-t", f"{length}",
                         "-filter_complex", fg, "-af", "asetpts=PTS-STARTPTS",
@@ -615,9 +697,11 @@ def main():
     ap.add_argument("--top", type=int, default=1, help="clips per chunk")
     ap.add_argument("--gameplay-confirmed", action="store_true",
                     help="confirm you visually checked that the source shows actual GTA gameplay before a live capture")
-    ap.add_argument("--layout", choices=("fill", "fit"), default="fill",
+    ap.add_argument("--layout", choices=("fill", "fit", "split"), default="fill",
                     help="fill (default): gameplay covers the full 9:16 screen, centered and shifted away from a side "
-                         "facecam; fit: whole source in the middle over a blurred background")
+                         "facecam; fit: whole source in the middle over a blurred background; "
+                         "split: creator facecam cropped on top, gameplay on bottom")
+    ap.add_argument("--split", action="store_true", help="shortcut for --layout split (creator facecam on top, gameplay on bottom)")
     ap.add_argument("--crop", action="store_true", help="same as --layout fill (kept for old commands)")
     ap.add_argument("--moment-source", choices=("chat", "combined", "audio"), default="chat",
                     help="rank by chat reactions (default), combine chat with audio/speech, or use audio/speech only")
@@ -626,7 +710,10 @@ def main():
                     help="auto (default): detect, and lock to Hindi once the stream is clearly Hindi (Hinglish captions); "
                          "hi / en: force it for the whole stream")
     ap.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE)
+    ap.add_argument("--max-clips", type=int, default=0, help="stop after generating N clips (0 = no limit)")
     ap.add_argument("--keep-minutes", type=int, default=30)
+    ap.add_argument("--burn-credit", action="store_true",
+                    help="burn 'via <creator>' text on the video for the first 4s (default: False; credit belongs in post captions)")
     ap.add_argument("--output-dir", default=None, help="override the output folder")
     a = ap.parse_args()
     global _forced_language
@@ -712,19 +799,24 @@ def main():
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 name = f"gta-{stamp}-{n_clips + 1}"
                 mp4 = os.path.join(out_dir, name + ".mp4")
-                layout = "fill" if a.crop else a.layout
-                crop_offset, source_roi = detect_smart_frame(c, start, a.clip_len) if layout == "fill" else (0.5, None)
-                smart_crop = layout == "fill"
+                layout = "split" if a.split else ("fill" if a.crop else a.layout)
+                crop_offset, source_roi, facecam_roi = (
+                    detect_smart_frame(c, start, a.clip_len)
+                    if layout in {"fill", "split"}
+                    else (0.5, None, None)
+                )
+                smart_crop = layout in {"fill", "split"}
                 pan_keys = None
                 if smart_crop and source_roi is None:
                     from player_track import track_player
                     pan_keys = track_player(c, start, a.clip_len)
                     if pan_keys is None:                  # driving / cutscene: the car sits mid-frame
                         crop_offset = 0.5
-                caption_margin_v = caption_margin_for_video(c, crop=smart_crop, source_roi=None if smart_crop else source_roi)
+                caption_margin_v = caption_margin_for_video(c, crop=smart_crop, source_roi=None if smart_crop else source_roi, layout=layout)
                 if cut(c, words, start, a.clip_len, mp4, who.get("credit"), crop=smart_crop,
                        crop_offset=crop_offset, source_roi=source_roi,
-                       caption_margin_v=caption_margin_v, layout=layout, pan_keys=pan_keys):
+                       caption_margin_v=caption_margin_v, layout=layout, pan_keys=pan_keys,
+                       facecam_roi=facecam_roi, burn_credit=a.burn_credit):
                     n_clips += 1
                     text = " ".join(w[2] for w in words if start <= w[0] < start + a.clip_len)
                     chat_summary = summarize_chat_window(chunk_chat, start, a.clip_len)
@@ -734,6 +826,7 @@ def main():
                         selection_signals = ["audio", "speech", "live-chat"]
                     else:
                         selection_signals = ["audio", "speech"]
+                    framing_name = "split-creator-gameplay" if (layout == "split" and facecam_roi) else ("fill-9x16" if smart_crop else "full-source-blur-fill")
                     with open(os.path.join(out_dir, name + ".json"), "w", encoding="utf-8") as meta:
                         json.dump({
                             "video": name + ".mp4", "channel": "gta", "source_url": a.url or a.file,
@@ -743,7 +836,7 @@ def main():
                             "caption_language": getattr(words, "caption_language", "English"),
                             "caption_fallback_reason": getattr(words, "caption_fallback_reason", None),
                             "caption_position": "lower-third-of-visible-gameplay",
-                            "framing": "fill-9x16" if smart_crop else "full-source-blur-fill",
+                            "framing": framing_name,
                             "gameplay_confirmed": a.gameplay_confirmed,
                             "moment_source_requested": a.moment_source,
                             "moment_source_used": chunk_moment_source,
@@ -757,11 +850,17 @@ def main():
                             "crop_offset": crop_offset if smart_crop else None,
                             "player_track": [[round(t, 2), round(x, 3)] for t, x in pan_keys] if pan_keys else None,
                             "source_roi": list(source_roi) if source_roi else None,
+                            "facecam_roi": list(facecam_roi) if facecam_roi else None,
                             "title": None, "youtube_description": None,
                             "instagram_caption": None, "hashtags": [], "tags": [], "youtube_tags": [], "post_at": None,
                             "approved": False, "posted": {}, "test": who["test"],
                         }, meta, indent=2, ensure_ascii=False)
                     print(f"  clip {name}.mp4  score {score}")
+                    if a.max_clips > 0 and n_clips >= a.max_clips:
+                        break
+            if a.max_clips > 0 and n_clips >= a.max_clips:
+                print(f"reached target of {a.max_clips} clip(s); stopping capture ...")
+                break
             for old in glob.glob(os.path.join(wdir, "chunk_*.ts")):
                 if old in done and time.time() - os.path.getmtime(old) > a.keep_minutes * 60:
                     os.remove(old)
