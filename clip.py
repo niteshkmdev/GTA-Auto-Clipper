@@ -26,7 +26,7 @@ FACE_MODEL = os.path.join(HERE, "models", "face_detection_yunet_2023mar.onnx")
 
 def ytdlp_cmd(*args):
     """yt-dlp needs a JavaScript runtime for YouTube; it only looks for deno by default, so fall back to node."""
-    cmd = [sys.executable, "-m", "yt_dlp"]
+    cmd = [sys.executable, "-m", "yt_dlp", "--extractor-args", "youtube:player_client=android"]
     if not shutil.which("deno"):
         for rt in ("node", "bun"):
             if shutil.which(rt):
@@ -840,8 +840,8 @@ def main():
     done, n_clips = set(), 0
     try:
         if a.vod:
-            target_top = a.max_clips if a.max_clips > 0 else 5
-            print(f"VOD mode active: scanning full source, will select Top {target_top} moments globally...")
+            target_top = a.max_clips if a.max_clips > 0 else "all qualifying"
+            print(f"VOD mode active: scanning full source, will select {target_top} moments globally...")
             candidates = []
             current_offset = 0.0
             while True:

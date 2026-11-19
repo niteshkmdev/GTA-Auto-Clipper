@@ -312,7 +312,8 @@ def download_chat_replay(url, out_dir):
 
     os.makedirs(out_dir, exist_ok=True)
     target_prefix = os.path.join(out_dir, "chat_replay")
-    cmd = [sys.executable, "-m", "yt_dlp", "--skip-download", "--write-subs",
+    cmd = [sys.executable, "-m", "yt_dlp", "--extractor-args", "youtube:player_client=android",
+           "--skip-download", "--write-subs",
            "--sub-langs", "live_chat", "--no-warnings", "-o", target_prefix, url]
     if not shutil.which("deno"):
         for rt in ("node", "bun"):
