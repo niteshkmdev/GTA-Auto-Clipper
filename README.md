@@ -61,8 +61,9 @@ Important options:
 | `--crop` | off | Old flag, same as `--layout fill` |
 | `--moment-source` | `chat` | Choose `chat`, `combined`, or `audio` for highlight selection |
 | `--spoken-language` | `auto` | `auto` detects the language and locks to Hindi (Hinglish captions) once a stream is clearly Hindi. `hi` / `en` force it for the whole stream |
+| `--channel` / `--lang` | `english` | Target channel: `english` (saves to `output/english/<date>_<streamer>/`) or `hindi` (saves to `output/hindi/<date>_<streamer>/`) |
 | `--no-chat` | off | Skip live-chat collection and use audio and speech only |
-| `--output-dir` | `output/<date>_<channel>/` | Custom destination folder |
+| `--output-dir` | auto | Custom destination folder (overrides default hierarchy) |
 | `--burn-credit` | off | Burn `via <creator>` watermark on the video for 4s (default off; creator credit is placed in post captions) |
 
 Examples: `--moment-source chat` uses chat reactions first; `--moment-source combined` scores chat, audio, and speech together; `--moment-source audio` uses the original audio and speech method. Chat mode falls back to audio and speech when it has no chat data.
@@ -78,15 +79,22 @@ python clip.py --file "C:\videos\gameplay.mp4" --test --clip-len 30
 Connect your YouTube account and an Instagram Creator or Business account to Zernio. Set the key and account IDs as private environment variables:
 
 ```powershell
+# English Channel (ClutchLoop):
 $env:ZERNIO_API_KEY = "YOUR_ZERNIO_API_KEY"
 $env:ZERNIO_YOUTUBE_ACCOUNT_ID = "YOUR_YOUTUBE_ACCOUNT_ID"
 $env:ZERNIO_INSTAGRAM_ACCOUNT_ID = "YOUR_INSTAGRAM_ACCOUNT_ID"
+
+# Hindi Channel (DesiClutch):
+$env:HINDI_ZERNIO_API_KEY = "YOUR_HINDI_ZERNIO_API_KEY"
+$env:HINDI_ZERNIO_YOUTUBE_ACCOUNT_ID = "YOUR_HINDI_YOUTUBE_ACCOUNT_ID"
+$env:HINDI_ZERNIO_INSTAGRAM_ACCOUNT_ID = "YOUR_HINDI_INSTAGRAM_ACCOUNT_ID"
 ```
 
-Review the clip and its JSON metadata, then mark the metadata `"approved": true`. Preview the schedule first:
+Review the clip and its JSON metadata, then mark the metadata `"approved": true`. Preview the schedule first (channel is auto-detected from folder path or pass `--channel hindi|english`):
 
 ```powershell
-python zernio_publish.py "output\gta-CLIP-ID" --scheduled-for "2026-11-18T12:00:00+05:30"
+python zernio_publish.py "output\english\STREAM_ID\clip-1" --scheduled-for "2026-11-18T12:00:00+05:30"
+python zernio_publish.py "output\hindi\STREAM_ID\clip-1" --scheduled-for "2026-11-18T12:00:00+05:30" --channel hindi
 ```
 
 The dry run sends nothing. To schedule the post to both accounts, add `--publish`:

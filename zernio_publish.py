@@ -16,10 +16,32 @@ import requests
 
 API = "https://zernio.com/api/v1"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
-PLATFORMS = (
-    ("youtube", "ZERNIO_YOUTUBE_ACCOUNT_ID"),
-    ("instagram", "ZERNIO_INSTAGRAM_ACCOUNT_ID"),
-)
+PLATFORMS_MAP = {
+    "english": (
+        ("youtube", "ZERNIO_YOUTUBE_ACCOUNT_ID"),
+        ("instagram", "ZERNIO_INSTAGRAM_ACCOUNT_ID"),
+    ),
+    "hindi": (
+        ("youtube", "HINDI_ZERNIO_YOUTUBE_ACCOUNT_ID"),
+        ("instagram", "HINDI_ZERNIO_INSTAGRAM_ACCOUNT_ID"),
+    ),
+}
+# Keep PLATFORMS for backwards compatibility with tests / imports
+PLATFORMS = PLATFORMS_MAP["english"]
+
+
+def detect_channel(clip_path, metadata):
+    parts = [p.lower() for p in clip_path.parts]
+    if "hindi" in parts:
+        return "hindi"
+    if "english" in parts:
+        return "english"
+    target = (metadata.get("channel_target") or metadata.get("language") or "").lower()
+    if target in {"hindi", "hi"}:
+        return "hindi"
+    if target in {"english", "en"}:
+        return "english"
+    return "english"
 
 
 def load_metadata(path):
@@ -119,6 +141,10 @@ def main():
     parser.add_argument("--now", action="store_true", help="publish immediately instead of scheduling")
     parser.add_argument("--publish", action="store_true", help="send the post to Zernio; otherwise only preview")
     parser.add_argument("--unattended", action="store_true", help="allow unreviewed metadata after one-time opt-in")
+    parser.add_argument("--channel", choices=("english", "hindi"), default=None,
+                        help="target channel ('english' or 'hindi'); defaults to auto-detecting from path/metadata")
+    parser.add_argument("--lang", choices=("english", "hindi"), dest="channel",
+                        help="alias for --channel")
     args = parser.parse_args()
     base = args.clip.with_suffix("") if args.clip.suffix.lower() in {".mp4", ".json"} else args.clip
     video_path, metadata_path = base.with_suffix(".mp4"), base.with_suffix(".json")
@@ -141,16 +167,28 @@ def main():
         sys.exit("Clip metadata is not approved. Review it, or configure unattended posting and pass --unattended.")
     if args.unattended and os.environ.get("GTA_UNATTENDED_POSTS") != "1":
         sys.exit("Set GTA_UNATTENDED_POSTS=1 in your private environment to enable unattended publishing.")
-    accounts = [(platform, os.environ.get(variable, "")) for platform, variable in PLATFORMS]
-    accounts = [(platform, account) for platform, account in accounts if account]
-    if args.publish and not accounts:
-        sys.exit("Set ZERNIO_YOUTUBE_ACCOUNT_ID and/or ZERNIO_INSTAGRAM_ACCOUNT_ID in your environment.")
-    api_key = os.environ.get("ZERNIO_API_KEY")
-    if args.publish and not api_key:
-        sys.exit("Set ZERNIO_API_KEY in your private environment. Do not put it in a prompt or source file.")
+    channel = args.channel or detect_channel(base, metadata)
+    platform_vars = PLATFORMS_MAP.get(channel, PLATFORMS_MAP["english"])
 
-    destinations = ', '.join(p for p, _ in accounts) or 'YouTube + Instagram (account IDs not configured)'
-    plan = f"{base.name}: {schedule or 'DRY RUN — no schedule sent'} -> {destinations}"
+    if channel == "hindi":
+        api_key = os.environ.get("HINDI_ZERNIO_API_KEY") or os.environ.get("ZERNIO_API_KEY")
+        accounts = [(platform, os.environ.get(variable, "")) for platform, variable in platform_vars]
+        accounts = [(platform, account) for platform, account in accounts if account]
+        if args.publish and not accounts:
+            sys.exit("Set HINDI_ZERNIO_YOUTUBE_ACCOUNT_ID and/or HINDI_ZERNIO_INSTAGRAM_ACCOUNT_ID in your environment.")
+        if args.publish and not api_key:
+            sys.exit("Set HINDI_ZERNIO_API_KEY or ZERNIO_API_KEY in your private environment. Do not put it in a prompt or source file.")
+    else:
+        api_key = os.environ.get("ZERNIO_API_KEY")
+        accounts = [(platform, os.environ.get(variable, "")) for platform, variable in platform_vars]
+        accounts = [(platform, account) for platform, account in accounts if account]
+        if args.publish and not accounts:
+            sys.exit("Set ZERNIO_YOUTUBE_ACCOUNT_ID and/or ZERNIO_INSTAGRAM_ACCOUNT_ID in your environment.")
+        if args.publish and not api_key:
+            sys.exit("Set ZERNIO_API_KEY in your private environment. Do not put it in a prompt or source file.")
+
+    destinations = ', '.join(p for p, _ in accounts) or f"{channel.title()} accounts (not configured)"
+    plan = f"[{channel.upper()}] {base.name}: {schedule or 'DRY RUN — no schedule sent'} -> {destinations}"
     print(plan)
     if not args.publish:
         print("No post sent. Add --publish to schedule or publish this clip.")

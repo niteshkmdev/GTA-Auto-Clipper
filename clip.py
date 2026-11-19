@@ -709,6 +709,10 @@ def main():
     ap.add_argument("--spoken-language", choices=("auto", "en", "hi"), default="auto",
                     help="auto (default): detect, and lock to Hindi once the stream is clearly Hindi (Hinglish captions); "
                          "hi / en: force it for the whole stream")
+    ap.add_argument("--channel", choices=("english", "hindi"), default=None,
+                    help="target channel ('english' or 'hindi'); sets output directory hierarchy (output/english/... vs output/hindi/...)")
+    ap.add_argument("--lang", choices=("english", "hindi"), dest="channel",
+                    help="alias for --channel")
     ap.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE)
     ap.add_argument("--max-clips", type=int, default=0, help="stop after generating N clips (0 = no limit)")
     ap.add_argument("--keep-minutes", type=int, default=30)
@@ -750,10 +754,14 @@ def main():
     if video_id:
         stream_folder += f"_{video_id}"
 
+    target_channel = a.channel
+    if not target_channel:
+        target_channel = "hindi" if a.spoken_language == "hi" else "english"
+
     base_out = TEST_OUT if who["test"] else OUTPUT_DIR
-    out_dir = os.path.abspath(a.output_dir) if a.output_dir else os.path.join(base_out, stream_folder)
+    out_dir = os.path.abspath(a.output_dir) if a.output_dir else os.path.join(base_out, target_channel, stream_folder)
     os.makedirs(out_dir, exist_ok=True)
-    wdir = os.path.join(WORK, stream_folder)
+    wdir = os.path.join(WORK, target_channel, stream_folder)
     os.makedirs(wdir, exist_ok=True)
     print(f"source: {title!r} by {who['name']}  ->  {out_dir}")
     print(f"moment finder: {a.moment_source} (chat mode falls back to audio/speech when chat is unavailable)")
@@ -829,7 +837,7 @@ def main():
                     framing_name = "split-creator-gameplay" if (layout == "split" and facecam_roi) else ("fill-9x16" if smart_crop else "full-source-blur-fill")
                     with open(os.path.join(out_dir, name + ".json"), "w", encoding="utf-8") as meta:
                         json.dump({
-                            "video": name + ".mp4", "channel": "gta", "source_url": a.url or a.file,
+                            "video": name + ".mp4", "channel": "gta", "channel_target": target_channel, "source_url": a.url or a.file,
                             "streamer": who["name"], "credit": who.get("credit"), "stream_title": title,
                             "score": score, "transcript": text,
                             "spoken_language": getattr(words, "spoken_language", "unknown"),
