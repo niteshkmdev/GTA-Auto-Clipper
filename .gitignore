@@ -15,6 +15,7 @@ output/
 .wrangler/
 .DS_Store
 
+.venv
 private/
 
 models/person_yolox_s_2022nov.onnx

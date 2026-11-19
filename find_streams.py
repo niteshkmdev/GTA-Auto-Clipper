@@ -11,7 +11,8 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-
+from dotenv import load_dotenv
+load_dotenv()
 API = "https://www.googleapis.com/youtube/v3/search"
 
 

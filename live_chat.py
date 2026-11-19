@@ -12,7 +12,8 @@ import urllib.request
 from collections import deque
 from datetime import datetime
 from urllib.parse import urlparse
-
+from dotenv import load_dotenv
+load_dotenv()
 
 CHAT_REACTION = re.compile(
     r"\b(?:lol|lmao|rofl|wtf|omg|no way|clip it|insane|crazy|rip|bruh|"

@@ -10,7 +10,8 @@ import os
 import sys
 import uuid
 from pathlib import Path
-
+from dotenv import load_dotenv
+load_dotenv()
 import requests
 
 API = "https://zernio.com/api/v1"
@@ -39,17 +40,21 @@ def scheduled_local_time(value):
 
 
 def post_body(metadata, public_url, accounts, schedule):
+    tags = metadata.get("tags") or metadata.get("youtube_tags") or [h.lstrip("#") for h in metadata.get("hashtags", [])]
     platforms = []
     for platform, account_id in accounts:
         entry = {"platform": platform, "accountId": account_id}
         if platform == "youtube":
-            entry["customContent"] = metadata["youtube_description"]
-            entry["platformSpecificData"] = {
+            yt_data = {
                 "title": metadata["title"][:100],
                 "visibility": "public",
                 "categoryId": "20",
                 "madeForKids": False,
             }
+            if tags:
+                yt_data["tags"] = tags
+            entry["customContent"] = metadata["youtube_description"]
+            entry["platformSpecificData"] = yt_data
         else:
             entry["customContent"] = metadata["instagram_caption"]
         platforms.append(entry)
@@ -59,6 +64,8 @@ def post_body(metadata, public_url, accounts, schedule):
         "platforms": platforms,
         "timezone": "Asia/Kolkata",
     }
+    if tags:
+        body["tags"] = tags
     if schedule == "now":
         body["publishNow"] = True
     else:

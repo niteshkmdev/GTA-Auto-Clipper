@@ -8,7 +8,8 @@ and return keyframes (t, x_centre as a fraction of the frame width) for a pannin
 """
 import math
 import os
-
+from dotenv import load_dotenv
+load_dotenv()
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))

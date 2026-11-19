@@ -655,9 +655,19 @@ def main():
         title = info.get("title", "")
     else:
         who, title, info = source_identity({"uploader": "local source"}, True), os.path.basename(a.file), {}
-    out_dir = os.path.abspath(a.output_dir) if a.output_dir else (TEST_OUT if who["test"] else OUTPUT_DIR)
+
+    start_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    clean_channel = re.sub(r"[^\w-]+", "_", who.get("name") or "stream").strip("_")
+    stream_folder = f"{start_stamp}_{clean_channel}"
+    video_id = info.get("id")
+    if video_id:
+        stream_folder += f"_{video_id}"
+
+    base_out = TEST_OUT if who["test"] else OUTPUT_DIR
+    out_dir = os.path.abspath(a.output_dir) if a.output_dir else os.path.join(base_out, stream_folder)
     os.makedirs(out_dir, exist_ok=True)
-    wdir = os.path.join(WORK, datetime.now().strftime("%Y%m%d-%H%M%S"))
+    wdir = os.path.join(WORK, stream_folder)
+    os.makedirs(wdir, exist_ok=True)
     print(f"source: {title!r} by {who['name']}  ->  {out_dir}")
     print(f"moment finder: {a.moment_source} (chat mode falls back to audio/speech when chat is unavailable)")
     chat = None
@@ -748,7 +758,7 @@ def main():
                             "player_track": [[round(t, 2), round(x, 3)] for t, x in pan_keys] if pan_keys else None,
                             "source_roi": list(source_roi) if source_roi else None,
                             "title": None, "youtube_description": None,
-                            "instagram_caption": None, "hashtags": [], "post_at": None,
+                            "instagram_caption": None, "hashtags": [], "tags": [], "youtube_tags": [], "post_at": None,
                             "approved": False, "posted": {}, "test": who["test"],
                         }, meta, indent=2, ensure_ascii=False)
                     print(f"  clip {name}.mp4  score {score}")

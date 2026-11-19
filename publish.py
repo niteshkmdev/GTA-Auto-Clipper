@@ -4,7 +4,8 @@ Usage:  python publish.py output\gta-CLIP-ID --publish --unattended --scheduled-
 Reads PUBLISH_API_KEY, PUBLISH_YOUTUBE_ACCOUNT_ID and PUBLISH_INSTAGRAM_ACCOUNT_ID from your private environment.
 """
 import os
-
+from dotenv import load_dotenv
+load_dotenv()
 for new, old in (("PUBLISH_API_KEY", "ZERNIO_API_KEY"), ("PUBLISH_YOUTUBE_ACCOUNT_ID", "ZERNIO_YOUTUBE_ACCOUNT_ID"),
                  ("PUBLISH_INSTAGRAM_ACCOUNT_ID", "ZERNIO_INSTAGRAM_ACCOUNT_ID")):
     if os.environ.get(new) and not os.environ.get(old):

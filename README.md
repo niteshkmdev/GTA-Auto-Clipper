@@ -15,7 +15,7 @@ The software is free and MIT-licensed. The optional AI workflow guide and prompt
 - Fills the whole 9:16 screen with gameplay by default (`--layout fill`), centered on the player. It samples frames for facecams, shifts the crop away from a persistent side facecam, and in stacked portrait streams cuts out the facecam and fills the screen with the gameplay part. `--layout fit` keeps the old look: the full source in the middle over a blurred background.
 - Resets audio and video timestamps before burning the captions.
 - Masks swear words and sexual words in the burned-in captions (for example `s***`) so platforms do not limit the clip; the original audio is unchanged.
-- Saves MP4 and JSON metadata in `output/`. It never posts as part of clipping.
+- Saves MP4 and JSON metadata in stream-separated folders under `output/` (named by capture date and channel, e.g. `output/<YYYYMMDD-HHMMSS>_<channelName>_<videoId>/`). It never posts as part of clipping.
 - Schedules reviewed clips through Zernio by default. Optional unattended scheduling is available after account setup and with a standing source-rights policy; dry-run is the default.
 
 ## Install
@@ -61,7 +61,7 @@ Important options:
 | `--moment-source` | `chat` | Choose `chat`, `combined`, or `audio` for highlight selection |
 | `--spoken-language` | `auto` | `auto` detects the language and locks to Hindi (Hinglish captions) once a stream is clearly Hindi. `hi` / `en` force it for the whole stream |
 | `--no-chat` | off | Skip live-chat collection and use audio and speech only |
-| `--output-dir` | `output/` | Custom destination folder |
+| `--output-dir` | `output/<date>_<channel>/` | Custom destination folder |
 
 Examples: `--moment-source chat` uses chat reactions first; `--moment-source combined` scores chat, audio, and speech together; `--moment-source audio` uses the original audio and speech method. Chat mode falls back to audio and speech when it has no chat data.
 
