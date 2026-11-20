@@ -108,13 +108,18 @@ def source_identity(info, test=False):
 
 
 # ---------- recording ----------
-def start_recorder(url, file_, chunk, max_seconds, outdir, quality="1080p"):
+def start_recorder(url, file_, chunk, max_seconds, outdir, quality="1440p"):
     os.makedirs(outdir, exist_ok=True)
     pat = os.path.join(outdir, "chunk_%05d.ts")
     if file_:
         inputs = ["-i", file_]
     else:
-        fmt = "bv[height<=1080]+ba/b[height<=1080]/b" if quality == "1080p" else "bv[height<=720]+ba/b[height<=720]/b"
+        if quality == "1440p":
+            fmt = "bv[height<=1440]+ba/b[height<=1440]/b"
+        elif quality == "1080p":
+            fmt = "bv[height<=1080]+ba/b[height<=1080]/b"
+        else:
+            fmt = "bv[height<=720]+ba/b[height<=720]/b"
         r = run(ytdlp_cmd("-g", "--no-warnings", "-f", fmt, url))
         lines = [l for l in r.stdout.splitlines() if l.startswith("http")]
         if r.returncode or not lines:
@@ -367,12 +372,14 @@ def ass_time(t):
     return f"{h}:{m:02d}:{s:05.2f}"
 
 
-def caption_margin_for_video(video_path, crop=False, source_roi=None, layout="fill"):
+def caption_margin_for_video(video_path, crop=False, source_roi=None, layout="fill", out_w=1080, out_h=1920):
     """Place captions near the lower third of visible gameplay, not the blurred canvas edge."""
-    output_width, output_height = 1080, 1920
+    output_width, output_height = out_w, out_h
     if layout == "split":
-        panel_top = 684
-        panel_height = 1236
+        cam_h = round(out_h * 680 / 1920) // 2 * 2
+        divider_h = 4
+        panel_top = cam_h + divider_h
+        panel_height = out_h - panel_top
     elif crop and not source_roi:
         panel_height = output_height
         panel_top = 0
@@ -394,8 +401,8 @@ def caption_margin_for_video(video_path, crop=False, source_roi=None, layout="fi
             panel_height = output_height
         panel_top = max(0, (output_height - panel_height) / 2)
     caption_center = panel_top + panel_height * 0.76
-    baseline_offset = 55
-    return max(100, min(1100, round(output_height - caption_center - baseline_offset)))
+    baseline_offset = round(55 * out_h / 1920)
+    return max(100, min(round(1100 * out_h / 1920), round(output_height - caption_center - baseline_offset)))
 
 
 # Burned-in captions: swear and sexual words are masked (F***) so platforms do not cut reach. The audio is unchanged.
@@ -447,7 +454,8 @@ def write_ass(path, words, start, length, credit=None, caption_margin_v=400, bur
             if gi + 1 < len(groups):
                 phrase_end = min(phrase_end, groups[gi + 1][0][0])
             for i, (s, e, _) in enumerate(phrase):
-                t_off = phrase[i + 1][0] if i + 1 < len(phrase) else phrase_end
+                next_start = phrase[i + 1][0] if i + 1 < len(phrase) else phrase_end
+                t_off = min(next_start, e + 0.35)
                 steps.append((s - start, t_off - start, phrase, i))
         for t_on, t_off, phrase, i in steps:
             t_on, t_off = max(0.0, t_on), min(float(length), t_off)
@@ -699,41 +707,54 @@ def decide_layout(facecam_roi, source_roi=None, reaction_score=0.0, chat_summary
     return "fill"
 
 
-def build_video_filter(ass_name, crop=False, crop_offset=0.5, source_roi=None, layout="fit", pan_keys=None,
-                       facecam_roi=None):
+def probe_source_resolution(video_path):
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+         "-of", "csv=s=x:p=0", video_path], capture_output=True, text=True,
+    )
+    for line in probe.stdout.splitlines():
+        m = re.fullmatch(r"(\d+)x(\d+)", line.strip())
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return 1920, 1080
+
+
+def build_video_filter(ass_name=None, crop=False, crop_offset=0.5, source_roi=None, layout="fit", pan_keys=None,
+                       facecam_roi=None, out_w=1080, out_h=1920):
     """layout "fill" (default in the CLI): gameplay covers the whole 9:16 frame, centered (or shifted away from a
     side facecam). layout "fit": the full source sits in the middle over a blurred copy.
     layout "split": creator facecam cropped on top, gameplay on bottom."""
     offset = min(1.0, max(0.0, float(crop_offset)))
+    ass_suffix = f",ass={ass_name}" if ass_name else ""
     if layout == "auto":
         layout = "split" if facecam_roi else "fill"
     if crop and layout != "split":
         layout = "fill"
     if layout == "split":
         if facecam_roi:
-            cam_h = 680
+            cam_h = round(out_h * 680 / 1920) // 2 * 2
             divider_h = 4
-            game_h = 1920 - cam_h - divider_h
+            game_h = out_h - cam_h - divider_h
             fx, fy, fw, fh = facecam_roi
             cam_pad_h = cam_h + divider_h
             if pan_keys:
                 from player_track import crop_x_expr
-                expr = crop_x_expr(pan_keys, out_w=1080)
+                expr = crop_x_expr(pan_keys, out_w=out_w)
                 game_filter = (
                     f"[0:v]setpts=PTS-STARTPTS,scale=-2:{game_h}:force_original_aspect_ratio=increase,"
-                    f"crop=1080:{game_h}:'{expr}':(ih-{game_h})/2[game];"
+                    f"crop={out_w}:{game_h}:'{expr}':(ih-{game_h})/2[game];"
                 )
             else:
                 game_filter = (
                     f"[0:v]setpts=PTS-STARTPTS,scale=-2:{game_h}:force_original_aspect_ratio=increase,"
-                    f"crop=1080:{game_h}:(iw-1080)*{offset:.4f}:(ih-{game_h})/2[game];"
+                    f"crop={out_w}:{game_h}:(iw-{out_w})*{offset:.4f}:(ih-{game_h})/2[game];"
                 )
             cam_filter = (
                 f"[0:v]crop={fw}:{fh}:{fx}:{fy},"
-                f"scale=1080:{cam_h}:force_original_aspect_ratio=increase,"
-                f"crop=1080:{cam_h},pad=1080:{cam_pad_h}:0:0:color=black[cam];"
+                f"scale={out_w}:{cam_h}:force_original_aspect_ratio=increase,"
+                f"crop={out_w}:{cam_h},pad={out_w}:{cam_pad_h}:0:0:color=black[cam];"
             )
-            return f"{cam_filter}{game_filter}[cam][game]vstack=inputs=2,setpts=PTS-STARTPTS,ass={ass_name}"
+            return f"{cam_filter}{game_filter}[cam][game]vstack=inputs=2,setpts=PTS-STARTPTS{ass_suffix}"
         layout = "fill"
     if layout == "fill":
         pre = ""
@@ -742,32 +763,40 @@ def build_video_filter(ass_name, crop=False, crop_offset=0.5, source_roi=None, l
             pre = f"crop={width}:{height}:{x}:{y},"
         if pan_keys and not source_roi:                    # follow the player (player_track.py)
             from player_track import crop_x_expr
-            return (f"[0:v]setpts=PTS-STARTPTS,scale=1080:1920:force_original_aspect_ratio=increase,"
-                    f"crop=1080:1920:'{crop_x_expr(pan_keys)}':(ih-1920)/2,ass={ass_name}")
-        return (f"[0:v]{pre}scale=1080:1920:force_original_aspect_ratio=increase,"
-                f"crop=1080:1920:(iw-1080)*{offset:.4f}:(ih-1920)/2,"
-                f"setpts=PTS-STARTPTS,ass={ass_name}")
+            return (f"[0:v]setpts=PTS-STARTPTS,scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+                    f"crop={out_w}:{out_h}:'{crop_x_expr(pan_keys, out_w=out_w)}':(ih-{out_h})/2{ass_suffix}")
+        return (f"[0:v]{pre}scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+                f"crop={out_w}:{out_h}:(iw-{out_w})*{offset:.4f}:(ih-{out_h})/2,"
+                f"setpts=PTS-STARTPTS{ass_suffix}")
     if source_roi:
         x, y, width, height = source_roi
         return (f"[0:v]crop={width}:{height}:{x}:{y},split[a][b];"
-                "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
-                "crop=1080:1920,boxblur=30:5[bg];[b]scale=1080:-2[fg];"
-                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setpts=PTS-STARTPTS,ass={ass_name}")
-    return ("[0:v]split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,"
-            "crop=1080:1920,boxblur=30:5[bg];[b]scale=1080:-2[fg];"
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2,setpts=PTS-STARTPTS,ass=" + ass_name)
+                f"[a]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+                f"crop={out_w}:{out_h},boxblur=30:5[bg];[b]scale={out_w}:-2[fg];"
+                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setpts=PTS-STARTPTS{ass_suffix}")
+    return (f"[0:v]split[a][b];[a]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+            f"crop={out_w}:{out_h},boxblur=30:5[bg];[b]scale={out_w}:-2[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setpts=PTS-STARTPTS{ass_suffix}")
 
 
 def cut(chunk_path, words, start, length, out_mp4, credit, crop=False, crop_offset=0.5,
         source_roi=None, caption_margin_v=400, layout="fit", pan_keys=None, facecam_roi=None,
-        burn_credit=False):
+        burn_credit=False, skip_captions=False, target_quality="1440p"):
     d = os.path.dirname(out_mp4)
-    ass_name = "cap_" + os.path.basename(out_mp4) + ".ass"
-    if layout == "split" and facecam_roi:
-        caption_margin_v = min(caption_margin_v, 320)
-    write_ass(os.path.join(d, ass_name), words, start, length, credit, caption_margin_v, burn_credit=burn_credit)
+    sw, sh = probe_source_resolution(chunk_path)
+    # Target 1440p (1440x2560); fallback to 1080p (1080x1920); never go below 1080p
+    if target_quality == "1440p" and sh >= 1440:
+        out_w, out_h = 1440, 2560
+    else:
+        out_w, out_h = 1080, 1920
+    ass_name = None
+    if not skip_captions:
+        ass_name = "cap_" + os.path.basename(out_mp4) + ".ass"
+        if layout == "split" and facecam_roi:
+            caption_margin_v = min(caption_margin_v, round(320 * out_h / 1920))
+        write_ass(os.path.join(d, ass_name), words, start, length, credit, caption_margin_v, burn_credit=burn_credit)
     fg = build_video_filter(ass_name, crop=crop, crop_offset=crop_offset, source_roi=source_roi, layout=layout,
-                            pan_keys=pan_keys, facecam_roi=facecam_roi)
+                            pan_keys=pan_keys, facecam_roi=facecam_roi, out_w=out_w, out_h=out_h)
     r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                         "-ss", f"{start:.2f}",
                         "-i", os.path.abspath(chunk_path),
@@ -776,7 +805,8 @@ def cut(chunk_path, words, start, length, out_mp4, credit, crop=False, crop_offs
                         "-c:v", "libx264", "-preset", "veryfast",
                         "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
                         os.path.basename(out_mp4)], cwd=d, capture_output=True, text=True)
-    os.remove(os.path.join(d, ass_name))
+    if ass_name and os.path.exists(os.path.join(d, ass_name)):
+        os.remove(os.path.join(d, ass_name))
     if r.returncode:
         print("ffmpeg cut failed:", r.stderr[-300:])
         return False
@@ -847,9 +877,13 @@ def main():
                     help="burn 'via <creator>' text on the video for the first 4s (default: False; credit belongs in post captions)")
     ap.add_argument("--no-cache", action="store_true",
                     help="ignore existing VOD analysis cache and re-analyze all chunks")
-    ap.add_argument("--quality", choices=("1080p", "720p"), default="1080p",
-                    help="source capture quality (default: 1080p)")
+    ap.add_argument("--quality", choices=("1440p", "1080p", "720p"), default="1440p",
+                    help="source capture quality (default: 1440p; falls back to 1080p)")
     ap.add_argument("--cookies", help="path to cookies.txt for YouTube authentication")
+    ap.add_argument("--skip-captions", action="store_true", default=None,
+                    help="do not burn captions onto the output clip (default: True for hindi, False for english)")
+    ap.add_argument("--captions", dest="skip_captions", action="store_false",
+                    help="force burn captions onto the output clip")
     ap.add_argument("--output-dir", default=None, help="override the output folder")
     a = ap.parse_args()
     global _forced_language, _cookies_file
@@ -890,6 +924,12 @@ def main():
     target_channel = a.channel
     if not target_channel:
         target_channel = "hindi" if a.spoken_language == "hi" else "english"
+
+    if a.skip_captions is not None:
+        skip_captions = a.skip_captions
+    else:
+        # Rule: Only English videos should be captioned. Hindi videos skip captions.
+        skip_captions = (target_channel == "hindi")
 
     base_out = TEST_OUT if who["test"] else OUTPUT_DIR
     target_parent = os.path.join(base_out, target_channel)
@@ -1072,7 +1112,8 @@ def main():
                 if cut(c, words, start, a.clip_len, mp4, who.get("credit"), crop=smart_crop,
                        crop_offset=crop_offset, source_roi=source_roi,
                        caption_margin_v=caption_margin_v, layout=layout, pan_keys=pan_keys,
-                       facecam_roi=facecam_roi, burn_credit=a.burn_credit):
+                       facecam_roi=facecam_roi, burn_credit=a.burn_credit,
+                       skip_captions=skip_captions, target_quality=a.quality):
                     n_clips += 1
                     text = " ".join(w[2] for w in ws)
                     if chunk_moment_source == "chat":
@@ -1164,7 +1205,8 @@ def main():
                     if cut(c, words, start, a.clip_len, mp4, who.get("credit"), crop=smart_crop,
                            crop_offset=crop_offset, source_roi=source_roi,
                            caption_margin_v=caption_margin_v, layout=layout, pan_keys=pan_keys,
-                           facecam_roi=facecam_roi, burn_credit=a.burn_credit):
+                           facecam_roi=facecam_roi, burn_credit=a.burn_credit,
+                           skip_captions=skip_captions):
                         n_clips += 1
                         text = " ".join(w[2] for w in ws)
                         if chunk_moment_source == "chat":

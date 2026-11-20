@@ -27,6 +27,13 @@ class ClipperReleaseTests(unittest.TestCase):
         self.assertIn('scale=1080:680', graph)
         self.assertIn('ass=captions.ass', graph)
 
+    def test_1440p_resolution_scales_filter_correctly(self):
+        graph = build_video_filter(layout='fill', out_w=1440, out_h=2560)
+        self.assertIn('crop=1440:2560', graph)
+        split_graph = build_video_filter(layout='split', facecam_roi=(0, 0, 480, 300), out_w=1440, out_h=2560)
+        self.assertIn('scale=1440:906', split_graph)
+        self.assertIn('crop=1440:1650', split_graph)
+
     def test_split_layout_falls_back_to_fill_when_no_facecam_is_found(self):
         graph = build_video_filter('captions.ass', layout='split', facecam_roi=None)
         self.assertNotIn('vstack', graph)
@@ -78,6 +85,13 @@ class ClipperReleaseTests(unittest.TestCase):
 
     def test_decide_layout_chooses_fill_for_action_or_calm_gameplay(self):
         self.assertEqual(decide_layout(facecam_roi=(0, 0, 480, 300), reaction_score=0.1, chat_summary={"reaction_chatters": 1}, words_count=4), "fill")
+
+    def test_build_video_filter_without_ass(self):
+        graph = build_video_filter(None, layout='fill', facecam_roi=None)
+        self.assertNotIn('ass=', graph)
+
+        graph_split = build_video_filter(None, layout='split', facecam_roi=(0, 0, 480, 300))
+        self.assertNotIn('ass=', graph_split)
 
     def test_build_video_filter_auto_defaults_to_split_with_facecam(self):
         graph = build_video_filter('captions.ass', layout='auto', facecam_roi=(0, 0, 480, 300))
@@ -343,3 +357,21 @@ class SpokenLanguageLockTest(unittest.TestCase):
             # Picks the earliest folder
             res = clip.find_existing_stream_folder(d, "techno", "xyz123")
             self.assertEqual(res, "20261120-010000_techno_xyz123")
+
+    def test_subtitles_clear_during_speech_pauses(self):
+        # Two words with a 2-second pause in between
+        words = [(1.0, 1.5, "hello"), (3.5, 4.0, "world")]
+        import tempfile, os
+        from clip import WordTimings, write_ass
+        with tempfile.TemporaryDirectory() as d:
+            ass_path = os.path.join(d, "pause_test.ass")
+            write_ass(ass_path, WordTimings(words, "en", "English"), 0, 10)
+            with open(ass_path, encoding="utf-8") as f:
+                lines = [l for l in f.read().splitlines() if l.startswith("Dialogue: 0,")]
+            # Dialogue for "hello" should terminate at e + 0.35s = 1.85s, NOT linger until 3.5s
+            self.assertTrue(len(lines) >= 2)
+            # Check end time of first dialogue event
+            end_time_str = lines[0].split(",")[2]
+            h, m, s = end_time_str.split(":")
+            end_seconds = int(h) * 3600 + int(m) * 60 + float(s)
+            self.assertLessEqual(end_seconds, 2.0)

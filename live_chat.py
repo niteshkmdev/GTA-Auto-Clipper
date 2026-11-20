@@ -303,7 +303,7 @@ def parse_yt_dlp_chat(file_path):
     return messages
 
 
-def download_chat_replay(url, out_dir):
+def download_chat_replay(url, out_dir, timeout=600):
     """Use yt-dlp to download YouTube live chat replay for completed broadcasts."""
     import shutil
     import subprocess
@@ -312,20 +312,28 @@ def download_chat_replay(url, out_dir):
 
     os.makedirs(out_dir, exist_ok=True)
     target_prefix = os.path.join(out_dir, "chat_replay")
-    cmd = [sys.executable, "-m", "yt_dlp", "--extractor-args", "youtube:player_client=android",
-           "--skip-download", "--write-subs",
-           "--sub-langs", "live_chat", "--no-warnings", "-o", target_prefix, url]
+    cmd = [sys.executable, "-m", "yt_dlp"]
+    c_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+    if os.path.isfile(c_file):
+        cmd += ["--cookies", c_file]
+    else:
+        cmd += ["--extractor-args", "youtube:player_client=android"]
+    cmd += ["--skip-download", "--write-subs",
+            "--sub-langs", "live_chat", "--no-warnings", "-o", target_prefix, url]
     if not shutil.which("deno"):
         for rt in ("node", "bun"):
             if shutil.which(rt):
                 cmd += ["--js-runtimes", rt]
                 break
     try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError):
-        return []
+        pass
 
     candidates = glob.glob(os.path.join(out_dir, "*.live_chat.json"))
     if candidates:
         return parse_yt_dlp_chat(candidates[0])
+    parts = glob.glob(os.path.join(out_dir, "*.live_chat.json.part"))
+    if parts:
+        return parse_yt_dlp_chat(parts[0])
     return []
